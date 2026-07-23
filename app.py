@@ -8,7 +8,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 from data_sources import (
     DEFAULT_X_HANDLES,
@@ -71,7 +70,7 @@ def inject_css() -> None:
         :root{--navy:#0a1e36;--blue:#153f68;--red:#b52b35;--ink:#172638;--muted:#647286;
           --paper:#fff;--canvas:#f4f6f8;--line:#dce2e8;--green:#137a52;--amber:#a46305}
         .stApp{background:var(--canvas);color:var(--ink);font-family:'DM Sans',sans-serif}
-        .block-container{max-width:1380px;padding:1rem 1.4rem 5rem}
+        .block-container{max-width:1380px;padding:1rem 1.4rem 8rem}
         [data-testid="stHeader"]{background:transparent}[data-testid="stSidebar"]{display:none}
         h1,h2,h3{font-family:'Libre Franklin',sans-serif!important;color:var(--navy);letter-spacing:-.035em}
         .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:12px}
@@ -112,7 +111,12 @@ def inject_css() -> None:
         .warning-box{background:#fff8e7;border:1px solid #eed698;border-radius:12px;padding:14px;color:#674e12;font-size:12px}
         .empty{background:#fff;border:1px dashed #bfc8d2;border-radius:13px;text-align:center;padding:28px;color:var(--muted);font-size:12px}
         .mobile-only{display:none}
-        div[data-testid="stPills"] button{font-size:12px;font-weight:700}
+        div[data-testid="stPills"],div[data-testid="stButtonGroup"]{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
+          z-index:1000;width:min(1040px,calc(100vw - 28px));margin:0!important;padding:8px;
+          background:rgba(16,28,42,.96);border:1px solid #526171;border-bottom:3px solid #8f2831;
+          box-shadow:0 12px 38px rgba(8,20,32,.3);backdrop-filter:blur(12px);overflow-x:auto}
+        div[data-testid="stPills"]>div,div[data-testid="stButtonGroup"]>div{min-width:max-content}
+        div[data-testid="stPills"] button,div[data-testid="stButtonGroup"] button{font-size:12px;font-weight:700}
         .stButton button,.stDownloadButton button,.stLinkButton a{border-radius:9px;font-weight:700}
         [data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:12px;overflow:hidden}
         footer{display:none}
@@ -126,8 +130,11 @@ def inject_css() -> None:
         .brand-title{color:#f1f3f4;font-family:'Libre Caslon Text',Georgia,serif;font-size:25px;font-weight:400}
         .brand-sub{color:#aeb9c4;font-family:'IBM Plex Mono',monospace;letter-spacing:.19em}
         .asof{color:#c4ccd4;font-family:'IBM Plex Mono',monospace;text-transform:uppercase}
-        div[data-testid="stPills"]{margin-bottom:7px}
-        div[data-testid="stPills"] button{border-radius:0!important;font-family:'IBM Plex Mono',monospace;text-transform:uppercase;letter-spacing:.04em;font-size:10px}
+        div[data-testid="stPills"] button,div[data-testid="stButtonGroup"] button{border-radius:0!important;border-color:#526171!important;
+          color:#dce4eb!important;background:#17293b!important;font-family:'IBM Plex Mono',monospace;
+          text-transform:uppercase;letter-spacing:.04em;font-size:10px;white-space:nowrap}
+        div[data-testid="stPills"] button[aria-pressed="true"],div[data-testid="stButtonGroup"] button[aria-pressed="true"]{background:#f4f6f8!important;
+          color:#8f2831!important;border-color:#f4f6f8!important}
         .board-kicker{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.17em;text-transform:uppercase;color:#76242c;font-weight:600}
         .board-title{font-family:'Libre Caslon Text',Georgia,serif;font-size:29px;line-height:1.1;color:#172435;margin:5px 0 8px}
         .board-rule{height:1px;background:#9ca8b3;margin-bottom:11px}
@@ -169,6 +176,7 @@ def inject_css() -> None:
         .connected{color:#167354}.connected:before{content:'';display:inline-block;width:6px;height:6px;background:#1d9168;border-radius:50%;margin-right:6px}
         .lower-board{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #8e2932;padding:10px 13px;height:286px;overflow:auto}
         .field-row{display:grid;grid-template-columns:58px 1fr auto;gap:11px;align-items:start;padding:8px 0;border-bottom:1px solid #dde2e7}
+        .field-calendar-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:22px}
         .field-row:last-child{border-bottom:0}.field-date{font-family:'IBM Plex Mono';font-size:8px;color:#7c2730;text-transform:uppercase;line-height:1.4;background:#f0e7e8;border-left:2px solid #8e2932;padding:5px 6px}
         .field-title{font-family:'Libre Caslon Text';font-weight:700;font-size:12px;color:#283646;line-height:1.3}
         .field-meta{font-size:9px;color:#798592;margin-top:4px}.field-region{font-family:'IBM Plex Mono';font-size:8px;color:#6d7884;text-transform:uppercase;white-space:nowrap}
@@ -176,7 +184,7 @@ def inject_css() -> None:
         .x-connect{font-family:'IBM Plex Mono';font-size:8px;text-transform:uppercase;letter-spacing:.08em;color:#157253;margin-bottom:8px}
         .x-roster-note{font-size:10px;line-height:1.45;color:#667483;padding:3px 0 7px}
         @media(max-width:700px){
-          .block-container{padding:.7rem .75rem 5rem}.topbar{align-items:flex-start}.asof{display:none}
+          .block-container{padding:.7rem .75rem 8rem}.topbar{align-items:flex-start}.asof{display:none}
           .star{width:35px;height:35px}.brand-title{font-size:16px}.hero{padding:21px 18px;border-radius:17px}
           .hero h1{font-size:26px}.metric{min-height:88px;padding:12px}.metric-value{font-size:23px}
           div[data-testid="stHorizontalBlock"]{gap:.55rem;flex-wrap:wrap}
@@ -191,6 +199,9 @@ def inject_css() -> None:
           .intelligence-grid{grid-template-columns:1fr}.publisher-grid{grid-template-columns:1fr}
           .hearing-board{min-height:210px}.publisher-panel{min-height:0}.board-title{font-size:25px}
           .lower-board{height:auto;max-height:410px}.field-row{grid-template-columns:52px 1fr}.field-region{display:none}
+          .field-calendar-grid{grid-template-columns:1fr}
+          div[data-testid="stPills"],div[data-testid="stButtonGroup"]{left:8px;right:8px;bottom:8px;transform:none;width:auto;padding:6px}
+          div[data-testid="stPills"] button,div[data-testid="stButtonGroup"] button{font-size:9px;min-height:38px}
         }
         </style>
         """,
@@ -420,10 +431,12 @@ def operations_strip(
     hearings: list[Hearing], headlines: list[Headline], events: list[PoliticalEvent]
 ) -> None:
     now = datetime.now(CENTRAL)
-    today_hearings = sum(
+    week_end = TODAY + timedelta(days=6)
+    week_hearings = sum(
         1
         for item in hearings
-        if item.starts_at and item.starts_at.astimezone(CENTRAL).date() == TODAY
+        if item.starts_at
+        and TODAY <= item.starts_at.astimezone(CENTRAL).date() <= week_end
     )
     fresh_headlines = sum(
         1
@@ -436,8 +449,8 @@ def operations_strip(
     organizations = len({item.organizer for item in events if item.organizer})
     st.markdown(
         f"""<div class="ops-strip">
-        <div class="ops-cell"><div class="ops-label">Hearings today</div>
-        <div class="ops-value">{today_hearings}</div><div class="ops-note">House + Senate</div></div>
+        <div class="ops-cell"><div class="ops-label">Hearings this week</div>
+        <div class="ops-value">{week_hearings}</div><div class="ops-note">Next seven days · House + Senate</div></div>
         <div class="ops-cell"><div class="ops-label">New reporting</div>
         <div class="ops-value">{fresh_headlines}</div><div class="ops-note">Published in 24 hours</div></div>
         <div class="ops-cell"><div class="ops-label">Next field event</div>
@@ -451,23 +464,26 @@ def operations_strip(
 
 def hearing_board(chamber: str, hearings: list[Hearing]) -> str:
     letter = chamber[0]
-    today_items = [
+    week_end = TODAY + timedelta(days=6)
+    week_items = [
         item for item in hearings
-        if item.chamber == chamber and item.starts_at and item.starts_at.astimezone(CENTRAL).date() == TODAY
+        if item.chamber == chamber
+        and item.starts_at
+        and TODAY <= item.starts_at.astimezone(CENTRAL).date() <= week_end
     ]
-    if today_items:
+    if week_items:
         body = "".join(
             f"""<div class="hearing-item"><div class="hearing-item-title">
             <a href="{safe_url(item.url)}" target="_blank">{escape(item.committee)}</a></div>
-            <div class="hearing-item-meta">{escape(fmt_time(item.starts_at, include_date=False))} · {escape(item.location)}</div></div>"""
-            for item in today_items[:4]
+            <div class="hearing-item-meta">{escape(fmt_time(item.starts_at))} · {escape(item.location)}</div></div>"""
+            for item in week_items[:6]
         )
-        meeting_state = f"{len(today_items)} meeting{'s' if len(today_items) != 1 else ''}"
+        meeting_state = f"{len(week_items)} this week"
     else:
         body = f"""<div class="hearing-empty"><span class="empty-ring"></span><div>
-        <div class="empty-title">No hearings scheduled</div>
-        <div class="empty-copy">No {escape(chamber)} committee meetings are posted for today.</div></div></div>"""
-        meeting_state = "No meetings"
+        <div class="empty-title">No hearings this week</div>
+        <div class="empty-copy">No {escape(chamber)} committee meetings are posted for the next seven days.</div></div></div>"""
+        meeting_state = "None this week"
     calendar_url = (
         "https://capitol.texas.gov/Committees/MeetingsUpcoming.aspx?Chamber=H"
         if chamber == "House"
@@ -546,7 +562,7 @@ def field_calendar_panel(events: list[PoliticalEvent]) -> str:
             <span class="event-kind">{escape(item.event_type)}</span></div>
             <div class="field-region">{escape(item.region)}</div></div>"""
         )
-    return "".join(rows)
+    return f'<div class="field-calendar-grid">{"".join(rows)}</div>'
 
 
 def social_posts_panel(posts: list[Any]) -> str:
@@ -596,19 +612,16 @@ def load_command_data() -> tuple[list[SourceResult], list[SourceResult], list[So
 
 
 def command_center() -> None:
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         hearing_future = executor.submit(live_hearings)
         headline_future = executor.submit(live_headlines)
         event_future = executor.submit(live_events)
-        directory_future = executor.submit(live_directory)
         hearing_results = hearing_future.result()
         headline_results = headline_future.result()
         event_results = event_future.result()
-        directory_result = directory_future.result()
     remember(hearing_results)
     remember(headline_results)
     remember(event_results)
-    remember(directory_result)
     hearings = flatten(hearing_results)
     headlines = dedupe_headlines(headline_results)
     events = dedupe_events(event_results)
@@ -616,7 +629,7 @@ def command_center() -> None:
     operations_strip(hearings, headlines, events)
     st.markdown(
         f"""<div class="intelligence-grid"><section><div class="board-kicker">Texas Legislature</div>
-        <div class="board-title">Today’s Hearings</div><div class="board-rule"></div>
+        <div class="board-title">This Week’s Hearings</div><div class="board-rule"></div>
         {hearing_board("House", hearings)}{hearing_board("Senate", hearings)}</section>
         <section><div class="board-kicker">Across Texas</div>
         <div class="board-title">Top Headlines</div><div class="board-rule"></div>
@@ -626,72 +639,19 @@ def command_center() -> None:
         <span>Updated {datetime.now(CENTRAL).strftime('%I:%M %p').lstrip('0')} CT</span></div>""",
         unsafe_allow_html=True,
     )
-    field_col, social_col = st.columns([1.15, 0.85], gap="medium")
-    with field_col:
-        st.markdown(
-            f"""<div class="board-kicker">Republican Field Network</div>
-            <div class="board-title">Upcoming GOP Events</div><div class="board-rule"></div>
-            <div class="lower-board">{field_calendar_panel(events)}</div>""",
-            unsafe_allow_html=True,
-        )
-        st.download_button(
-            "Download GOP calendar (.ics)",
-            make_ics(events, "Texas Republican field calendar"),
-            "texas-gop-calendar.ics",
-            "text/calendar",
-            width="stretch",
-        )
-    with social_col:
-        st.markdown(
-            """<div class="board-kicker">Legislative Signal</div>
-            <div class="board-title">Live Legislator X Feed</div><div class="board-rule"></div>""",
-            unsafe_allow_html=True,
-        )
-        feed_accounts = public_feed_accounts(directory_result.items)
-        public_posts = live_public_posts(tuple(feed_accounts))
-        remember(public_posts)
-        if public_posts.items:
-            st.markdown(
-                '<div class="x-connect">● Live public posts · no token required · '
-                f'{len(public_posts.items)} recent</div>'
-                f'<div class="lower-board">{social_posts_panel(public_posts.items)}</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                '<div class="x-connect">● Embedded public list · read-only fallback</div>'
-                '<div class="x-roster-note">Live public posts are temporarily unavailable — X is '
-                "rate-limiting anonymous requests. Recent posts return automatically once the limit "
-                "clears; the embedded list timeline is shown below in the meantime.</div>",
-                unsafe_allow_html=True,
-            )
-            components.html(
-                """
-                <style>
-                  html,body{margin:0;background:#f9fafb;font-family:Arial,sans-serif}
-                  .fallback{padding:9px 12px;border:1px solid #cbd2d9;color:#5f6d7b;font-size:12px}
-                  .fallback a{color:#1c4f78;font-weight:700}
-                </style>
-                <div class="fallback">If the public widget is blocked or rate-limited,
-                  <a href="https://x.com/TexasLRL/lists/txlegislators" target="_blank">open the live list on X ↗</a>
-                </div>
-                <a class="twitter-timeline"
-                   data-height="286"
-                   data-chrome="noheader nofooter transparent"
-                   href="https://x.com/TexasLRL/lists/txlegislators?ref_src=twsrc%5Etfw">
-                   An X List by TexasLRL
-                </a>
-                <script async src="https://platform.x.com/widgets.js" charset="utf-8"></script>
-                """,
-                height=340,
-                scrolling=True,
-            )
-        st.link_button("Open the live Texas Legislators list on X ↗", LRL_X_LIST, width="stretch")
-        with st.expander("Official legislator account links (X widget fallback)"):
-            st.markdown(
-                f'<div class="lower-board">{social_directory_panel(directory_result.items)}</div>',
-                unsafe_allow_html=True,
-            )
+    st.markdown(
+        f"""<div class="board-kicker">Republican Field Network</div>
+        <div class="board-title">Upcoming GOP Events</div><div class="board-rule"></div>
+        <div class="lower-board">{field_calendar_panel(events)}</div>""",
+        unsafe_allow_html=True,
+    )
+    st.download_button(
+        "Download GOP calendar (.ics)",
+        make_ics(events, "Texas Republican field calendar"),
+        "texas-gop-calendar.ics",
+        "text/calendar",
+        width="stretch",
+    )
 
 
 def legislature_page() -> None:
@@ -1060,17 +1020,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-pages = ["Command center", "Legislature", "Campaign finance", "Media", "Legislators on X", "GOP calendar", "Source health"]
-page = st.pills("Navigation", pages, default="Command center", label_visibility="collapsed")
-
-refresh_col, note_col = st.columns([1, 5])
-with refresh_col:
-    if st.button("↻ Refresh", width="stretch"):
-        st.cache_data.clear()
-        st.session_state.pop("source_health", None)
-        st.rerun()
-with note_col:
-    st.caption("Official records govern. Media, social, and event feeds are attributed intelligence sources.")
+pages = ["Command center", "Legislature", "Campaign finance", "Media", "GOP calendar", "Source health"]
+if st.session_state.get("bottom_navigation") not in pages:
+    st.session_state["bottom_navigation"] = "Command center"
+page = st.session_state["bottom_navigation"]
 
 if page == "Command center":
     command_center()
@@ -1080,9 +1033,14 @@ elif page == "Campaign finance":
     finance_page()
 elif page == "Media":
     headlines_page()
-elif page == "Legislators on X":
-    social_page()
 elif page == "GOP calendar":
     events_page()
 else:
     source_health_page()
+
+st.pills(
+    "Navigation",
+    pages,
+    key="bottom_navigation",
+    label_visibility="collapsed",
+)
