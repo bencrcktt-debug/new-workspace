@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from html import escape
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
@@ -11,7 +11,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from data_sources import (
+    DEFAULT_X_HANDLES,
     LRL_X_LIST,
+    PUBLIC_FEED_MAX_ACCOUNTS,
     TEC_FINANCE_HOME,
     dedupe_events,
     dedupe_headlines,
@@ -20,6 +22,7 @@ from data_sources import (
     fetch_headlines,
     fetch_hearings,
     fetch_legislative_activity,
+    fetch_public_legislator_posts,
     fetch_social_directory,
     fetch_social_posts,
     fetch_x_list_posts,
@@ -135,6 +138,11 @@ def inject_css() -> None:
         .countdown-name{font-family:'Libre Caslon Text',Georgia,serif;font-size:16px;font-weight:700;color:#1d2a3a;margin:4px 0 0 29px}
         .countdown-number{font-family:'Libre Caslon Text',Georgia,serif;font-size:34px;color:#283544;line-height:1;text-align:right}
         .countdown-unit{font-family:'IBM Plex Mono';font-size:8px;letter-spacing:.08em;text-transform:uppercase;margin-left:5px;color:#5d6875}
+        .ops-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));background:#16283a;color:#eef3f6;margin:-1px 0 15px;border-bottom:3px solid #8e2932}
+        .ops-cell{padding:10px 14px;border-right:1px solid #405063;min-width:0}.ops-cell:last-child{border-right:0}
+        .ops-label{font-family:'IBM Plex Mono';font-size:7px;letter-spacing:.13em;text-transform:uppercase;color:#9dacba}
+        .ops-value{font-family:'Libre Caslon Text';font-size:16px;font-weight:700;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .ops-note{font-family:'IBM Plex Mono';font-size:7px;color:#aeb9c4;margin-top:3px;text-transform:uppercase}
         .intelligence-grid{display:grid;grid-template-columns:minmax(350px, .9fr) minmax(600px, 1.35fr);gap:17px}
         .hearing-board{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #1c3044;min-height:190px;margin-bottom:8px;display:flex;flex-direction:column}
         .hearing-board.senate{border-top-color:#8e2932}.hearing-head{display:flex;justify-content:space-between;align-items:center;padding:9px 13px;border-bottom:1px solid #d9dee3}
@@ -161,9 +169,10 @@ def inject_css() -> None:
         .connected{color:#167354}.connected:before{content:'';display:inline-block;width:6px;height:6px;background:#1d9168;border-radius:50%;margin-right:6px}
         .lower-board{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #8e2932;padding:10px 13px;height:286px;overflow:auto}
         .field-row{display:grid;grid-template-columns:58px 1fr auto;gap:11px;align-items:start;padding:8px 0;border-bottom:1px solid #dde2e7}
-        .field-row:last-child{border-bottom:0}.field-date{font-family:'IBM Plex Mono';font-size:8px;color:#7c2730;text-transform:uppercase;line-height:1.4}
+        .field-row:last-child{border-bottom:0}.field-date{font-family:'IBM Plex Mono';font-size:8px;color:#7c2730;text-transform:uppercase;line-height:1.4;background:#f0e7e8;border-left:2px solid #8e2932;padding:5px 6px}
         .field-title{font-family:'Libre Caslon Text';font-weight:700;font-size:12px;color:#283646;line-height:1.3}
         .field-meta{font-size:9px;color:#798592;margin-top:4px}.field-region{font-family:'IBM Plex Mono';font-size:8px;color:#6d7884;text-transform:uppercase;white-space:nowrap}
+        .event-kind{display:inline-block;margin-top:5px;padding:2px 5px;background:#e8edf1;color:#4c5a68;font-family:'IBM Plex Mono';font-size:7px;text-transform:uppercase;letter-spacing:.05em}
         .x-connect{font-family:'IBM Plex Mono';font-size:8px;text-transform:uppercase;letter-spacing:.08em;color:#157253;margin-bottom:8px}
         .x-roster-note{font-size:10px;line-height:1.45;color:#667483;padding:3px 0 7px}
         @media(max-width:700px){
@@ -178,6 +187,7 @@ def inject_css() -> None:
           .topbar{margin:0 -.75rem 10px;padding:14px .85rem}.brand-title{font-size:20px}
           .countdown-grid{grid-template-columns:1fr}.countdown{min-height:82px;border-right:0;border-bottom:1px solid #d2d8de}
           .countdown:last-child{border-bottom:0}.countdown-number{font-size:31px}.countdown-name{font-size:16px}
+          .ops-strip{grid-template-columns:repeat(2,1fr)}.ops-cell:nth-child(2){border-right:0}.ops-cell{border-bottom:1px solid #405063}
           .intelligence-grid{grid-template-columns:1fr}.publisher-grid{grid-template-columns:1fr}
           .hearing-board{min-height:210px}.publisher-panel{min-height:0}.board-title{font-size:25px}
           .lower-board{height:auto;max-height:410px}.field-row{grid-template-columns:52px 1fr}.field-region{display:none}
@@ -240,6 +250,38 @@ def live_posts(
 @st.cache_data(ttl=300, show_spinner=False)
 def live_x_list_posts(token: str, base_url: str) -> SourceResult:
     return fetch_x_list_posts(token, base_url)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def live_public_posts(accounts: tuple[LegislatorSocialAccount, ...]) -> SourceResult:
+    return fetch_public_legislator_posts(list(accounts))
+
+
+def public_feed_accounts(
+    directory_items: list[LegislatorSocialAccount],
+) -> list[LegislatorSocialAccount]:
+    """Ordered legislator accounts for the no-token public feed.
+
+    Prefers configured default handles, then fills from the live LRL directory. Falls
+    back to a small built-in handle set only if the directory is unavailable.
+    """
+    defaults = get_secret("SOCIAL_DEFAULT_HANDLES", get_secret("TXLEGE_X_HANDLES", []))
+    default_handles = [str(x).lstrip("@") for x in defaults] if isinstance(defaults, list) else []
+    if directory_items:
+        by_handle = {a.handle.lower(): a for a in directory_items}
+        ordered = [by_handle[h.lower()] for h in default_handles if h.lower() in by_handle]
+        seen = {a.handle.lower() for a in ordered}
+        for account in directory_items:
+            if account.handle.lower() not in seen:
+                ordered.append(account)
+                seen.add(account.handle.lower())
+    else:
+        handles = default_handles or list(DEFAULT_X_HANDLES)
+        ordered = [
+            LegislatorSocialAccount(name=h, chamber="", handle=h, profile_url=f"https://x.com/{h}")
+            for h in handles
+        ]
+    return ordered[:PUBLIC_FEED_MAX_ACCOUNTS]
 
 
 def remember(results: SourceResult | Iterable[SourceResult]) -> None:
@@ -374,6 +416,39 @@ def countdown_strip() -> None:
     st.markdown(f'<div class="countdown-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
+def operations_strip(
+    hearings: list[Hearing], headlines: list[Headline], events: list[PoliticalEvent]
+) -> None:
+    now = datetime.now(CENTRAL)
+    today_hearings = sum(
+        1
+        for item in hearings
+        if item.starts_at and item.starts_at.astimezone(CENTRAL).date() == TODAY
+    )
+    fresh_headlines = sum(
+        1
+        for item in headlines
+        if item.published_at and item.published_at >= now - timedelta(hours=24)
+    )
+    next_event = next((item for item in events if item.starts_at and item.starts_at >= now), None)
+    next_event_value = next_event.title if next_event else "No dated event"
+    next_event_note = fmt_time(next_event.starts_at) if next_event else "Check source calendars"
+    organizations = len({item.organizer for item in events if item.organizer})
+    st.markdown(
+        f"""<div class="ops-strip">
+        <div class="ops-cell"><div class="ops-label">Hearings today</div>
+        <div class="ops-value">{today_hearings}</div><div class="ops-note">House + Senate</div></div>
+        <div class="ops-cell"><div class="ops-label">New reporting</div>
+        <div class="ops-value">{fresh_headlines}</div><div class="ops-note">Published in 24 hours</div></div>
+        <div class="ops-cell"><div class="ops-label">Next field event</div>
+        <div class="ops-value">{escape(next_event_value)}</div><div class="ops-note">{escape(next_event_note)}</div></div>
+        <div class="ops-cell"><div class="ops-label">GOP network</div>
+        <div class="ops-value">{organizations} organizations</div><div class="ops-note">{len(events)} dated events</div></div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+
 def hearing_board(chamber: str, hearings: list[Hearing]) -> str:
     letter = chamber[0]
     today_items = [
@@ -458,7 +533,7 @@ def field_calendar_panel(events: list[PoliticalEvent]) -> str:
     if not events:
         return '<div class="empty">No upcoming Republican events were returned.</div>'
     rows = []
-    for item in events[:6]:
+    for item in events[:8]:
         date_label = (
             item.starts_at.astimezone(CENTRAL).strftime("%b %d<br>%I:%M %p").replace(" 0", " ")
             if item.starts_at
@@ -467,7 +542,8 @@ def field_calendar_panel(events: list[PoliticalEvent]) -> str:
         rows.append(
             f"""<div class="field-row"><div class="field-date">{date_label}</div><div>
             <div class="field-title"><a href="{safe_url(item.url)}" target="_blank">{escape(item.title)} ↗</a></div>
-            <div class="field-meta">{escape(item.organizer)}{(' · ' + escape(item.venue)) if item.venue else ''}</div></div>
+            <div class="field-meta">{escape(item.organizer)}{(' · ' + escape(item.venue)) if item.venue else ''}</div>
+            <span class="event-kind">{escape(item.event_type)}</span></div>
             <div class="field-region">{escape(item.region)}</div></div>"""
         )
     return "".join(rows)
@@ -537,6 +613,7 @@ def command_center() -> None:
     headlines = dedupe_headlines(headline_results)
     events = dedupe_events(event_results)
     countdown_strip()
+    operations_strip(hearings, headlines, events)
     st.markdown(
         f"""<div class="intelligence-grid"><section><div class="board-kicker">Texas Legislature</div>
         <div class="board-title">Today’s Hearings</div><div class="board-rule"></div>
@@ -549,7 +626,7 @@ def command_center() -> None:
         <span>Updated {datetime.now(CENTRAL).strftime('%I:%M %p').lstrip('0')} CT</span></div>""",
         unsafe_allow_html=True,
     )
-    field_col, social_col = st.columns([1, 1], gap="medium")
+    field_col, social_col = st.columns([1.15, 0.85], gap="medium")
     with field_col:
         st.markdown(
             f"""<div class="board-kicker">Republican Field Network</div>
@@ -567,31 +644,48 @@ def command_center() -> None:
     with social_col:
         st.markdown(
             """<div class="board-kicker">Legislative Signal</div>
-            <div class="board-title">Live Legislator X Feed</div><div class="board-rule"></div>
-            <div class="x-connect">● Official Texas LRL public list · no token required</div>""",
+            <div class="board-title">Live Legislator X Feed</div><div class="board-rule"></div>""",
             unsafe_allow_html=True,
         )
-        components.html(
-            """
-            <style>
-              html,body{margin:0;background:#f9fafb;font-family:Arial,sans-serif}
-              .fallback{padding:9px 12px;border:1px solid #cbd2d9;color:#5f6d7b;font-size:12px}
-              .fallback a{color:#1c4f78;font-weight:700}
-            </style>
-            <div class="fallback">If the public widget is blocked or rate-limited,
-              <a href="https://x.com/TexasLRL/lists/txlegislators" target="_blank">open the live list on X ↗</a>
-            </div>
-            <a class="twitter-timeline"
-               data-height="286"
-               data-chrome="noheader nofooter transparent"
-               href="https://x.com/TexasLRL/lists/txlegislators?ref_src=twsrc%5Etfw">
-               An X List by TexasLRL
-            </a>
-            <script async src="https://platform.x.com/widgets.js" charset="utf-8"></script>
-            """,
-            height=340,
-            scrolling=True,
-        )
+        feed_accounts = public_feed_accounts(directory_result.items)
+        public_posts = live_public_posts(tuple(feed_accounts))
+        remember(public_posts)
+        if public_posts.items:
+            st.markdown(
+                '<div class="x-connect">● Live public posts · no token required · '
+                f'{len(public_posts.items)} recent</div>'
+                f'<div class="lower-board">{social_posts_panel(public_posts.items)}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="x-connect">● Embedded public list · read-only fallback</div>'
+                '<div class="x-roster-note">Live public posts are temporarily unavailable — X is '
+                "rate-limiting anonymous requests. Recent posts return automatically once the limit "
+                "clears; the embedded list timeline is shown below in the meantime.</div>",
+                unsafe_allow_html=True,
+            )
+            components.html(
+                """
+                <style>
+                  html,body{margin:0;background:#f9fafb;font-family:Arial,sans-serif}
+                  .fallback{padding:9px 12px;border:1px solid #cbd2d9;color:#5f6d7b;font-size:12px}
+                  .fallback a{color:#1c4f78;font-weight:700}
+                </style>
+                <div class="fallback">If the public widget is blocked or rate-limited,
+                  <a href="https://x.com/TexasLRL/lists/txlegislators" target="_blank">open the live list on X ↗</a>
+                </div>
+                <a class="twitter-timeline"
+                   data-height="286"
+                   data-chrome="noheader nofooter transparent"
+                   href="https://x.com/TexasLRL/lists/txlegislators?ref_src=twsrc%5Etfw">
+                   An X List by TexasLRL
+                </a>
+                <script async src="https://platform.x.com/widgets.js" charset="utf-8"></script>
+                """,
+                height=340,
+                scrolling=True,
+            )
         st.link_button("Open the live Texas Legislators list on X ↗", LRL_X_LIST, width="stretch")
         with st.expander("Official legislator account links (X widget fallback)"):
             st.markdown(
@@ -869,21 +963,45 @@ def social_page() -> None:
 
 def events_page() -> None:
     st.markdown("## Republican field calendar")
-    st.caption("Best-effort aggregation from official party and club calendars across Texas major metros.")
+    st.caption(
+        "Dated events from official state, county, federated Republican women, club, and committee calendars."
+    )
     results = live_events()
     remember(results)
     events = dedupe_events(results)
-    c1, c2, c3 = st.columns([1, 1, 2])
+    organizations = sorted({x.organizer for x in events if x.organizer})
+    upcoming_30 = sum(
+        1
+        for x in events
+        if x.starts_at and TODAY <= x.starts_at.astimezone(CENTRAL).date() <= TODAY + timedelta(days=30)
+    )
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        metric("Dated events", str(len(events)), "deduplicated")
+    with summary_cols[1]:
+        metric("Organizations", str(len(organizations)), "named hosts")
+    with summary_cols[2]:
+        metric("Next 30 days", str(upcoming_30), "field activity")
+    with summary_cols[3]:
+        metric(
+            "Sources online",
+            f"{sum(1 for x in results if x.ok)}/{len(results)}",
+            "live or cached",
+        )
+    c1, c2, c3, c4 = st.columns([1, 1, 1.35, 1.65])
     with c1:
         region = st.selectbox("Region", ["All"] + sorted({x.region for x in events}))
     with c2:
         event_type = st.selectbox("Event type", ["All"] + sorted({x.event_type for x in events}))
     with c3:
+        organizer = st.selectbox("Organization", ["All"] + organizations)
+    with c4:
         query = st.text_input("Search events", placeholder="Club, organizer, venue, or keyword")
     shown = [
         x for x in events
         if (region == "All" or x.region == region)
         and (event_type == "All" or x.event_type == event_type)
+        and (organizer == "All" or x.organizer == organizer)
         and (not query or query.lower() in f"{x.title} {x.organizer} {x.venue}".lower())
     ]
     if shown:
@@ -893,8 +1011,10 @@ def events_page() -> None:
             "texas-republican-field-calendar.ics",
             "text/calendar",
         )
-        for item in shown:
-            event_card(item)
+        event_columns = st.columns(2)
+        for index, item in enumerate(shown):
+            with event_columns[index % 2]:
+                event_card(item)
     else:
         empty_state("No upcoming events match these filters.")
     with st.expander("Connected sources and status"):

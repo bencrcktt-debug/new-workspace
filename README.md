@@ -9,8 +9,8 @@ A responsive Texas legislative and Republican political-intelligence dashboard f
 - Current Texas Ethics Commission PAC contributions and expenditures
 - Fresh Texas political headlines from the Texas Tribune and three seven-day multi-publisher feeds
 - The Legislative Reference Library's current directory of legislators on X
-- A live X feed from the official LRL legislator list using X API v2
-- Optional account-filtered X posts for a bounded selection of legislators
+- A live X feed of recent legislator posts on the command center, pulled from X's public syndication endpoint with no token required
+- Optional token-based, account-filtered X posts (X API v2) for a bounded selection of legislators
 - Republican Party and club events across Austin, Dallas–Fort Worth, Houston, San Antonio, and statewide sources
 - Runtime freshness, latency, record counts, and fallback status for every checked source
 
@@ -27,7 +27,9 @@ Open `http://localhost:8501`.
 
 ## Configure X
 
-The complete legislator directory works without credentials. Live list posts and account-filtered cards require X API v2 read access. A token can be entered for the current browser session or stored in Streamlit secrets.
+The command center's live legislator feed and the complete legislator directory both work without credentials — the feed reads X's public syndication timelines, the same JSON X's own embed widgets use. That endpoint is rate-limited for anonymous callers (about 30 requests per window per IP), so results are cached and the app falls back to the embedded list timeline and a direct link when the limit is hit.
+
+Only the account-filtered cards on the "Legislators on X" tab require X API v2 read access. A token can be entered for the current browser session or stored in Streamlit secrets.
 
 Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`:
 
@@ -59,7 +61,8 @@ Remote results are cached by source: X for 5 minutes, legislative/news feeds for
 | Legislator accounts | Legislative Reference Library | Parsed daily; no party affiliation inferred |
 | Headlines | Texas Tribune politics feed and three seven-day Google News RSS queries | Deduplicated, attributed, newest-first, and relevance-ranked |
 | Republican events | RPT and major-county public calendars | Best-effort because publishers use different calendar systems |
-| X posts | X API v2 list-posts and user-posts endpoints | Requires post-read access; account-filtered requests are limited to 10 accounts |
+| X posts (command center) | X public syndication profile timelines | No token; merged from a bounded set of legislator handles; rate-limited, cached, with embed/link fallback |
+| X posts (Legislators on X tab) | X API v2 list-posts and user-posts endpoints | Requires post-read access; account-filtered requests are limited to 10 accounts |
 
 If a source fails after a successful request, the in-process last-good response is shown as stale. If no successful response exists, the relevant page remains usable with an unavailable state and authoritative links.
 

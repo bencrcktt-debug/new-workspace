@@ -15,12 +15,15 @@ from data_sources import (
     dedupe_events,
     dedupe_headlines,
     fetch_hearing_feed,
+    fetch_public_legislator_posts,
     fetch_social_posts,
     fetch_x_list_posts,
     make_ics,
     parse_bullpen_daily,
     parse_finance_workbook,
+    parse_ics_events,
     parse_lrl_directory,
+    parse_syndication_timeline,
     parse_texan_headlines,
     safe_datetime,
 )
@@ -146,6 +149,46 @@ def test_x_list_posts_are_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.items[0].url == "https://x.com/JaneTX/status/123"
 
 
+def test_syndication_timeline_keeps_only_original_posts() -> None:
+    account = LegislatorSocialAccount("Jane Example", "House", "JaneTX", "https://x.com/JaneTX")
+    posts = parse_syndication_timeline(
+        (FIXTURES / "x_syndication.html").read_bytes(), account, limit=5
+    )
+    # Reply (1002) and retweet (1003) are dropped; two original posts remain, newest first.
+    assert [p.url for p in posts] == [
+        "https://x.com/JaneTX/status/1001",
+        "https://x.com/JaneTX/status/1004",
+    ]
+    assert posts[0].text == "Filed a bill on property tax relief today. & more to come."
+    assert posts[0].legislator_name == "Jane Example"
+    assert posts[0].likes == 42 and posts[0].reposts == 7
+    assert posts[0].created_at == datetime(2026, 7, 22, 10, 30, tzinfo=CENTRAL)
+
+
+def test_public_feed_reports_unavailable_without_accounts() -> None:
+    result = fetch_public_legislator_posts([])
+    assert result.freshness == "unavailable"
+    assert not result.items
+
+
+def test_public_feed_merges_and_sorts_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    fixture = (FIXTURES / "x_syndication.html").read_bytes()
+    monkeypatch.setattr(
+        "data_sources.SYNDICATION_CLIENT.get",
+        lambda *_args, **_kwargs: (fixture, False, 7, ""),
+    )
+    accounts = [
+        LegislatorSocialAccount(f"Member {i}", "House", f"handle{i}", f"https://x.com/handle{i}")
+        for i in range(3)
+    ]
+    result = fetch_public_legislator_posts(accounts, per_account=2, total=10)
+    assert result.freshness == "live"
+    # 3 accounts x 2 original posts each, newest first across the merged set.
+    assert len(result.items) == 6
+    timestamps = [p.created_at for p in result.items]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+
 def test_texan_homepage_parser_uses_article_timestamp() -> None:
     body = b"""<html><body><article>
     <a href="/state/article_123.html" aria-label="Fresh Texas policy story"></a>
@@ -197,6 +240,26 @@ def test_events_dedupe_and_ics_escape() -> None:
     calendar = make_ics([event], "Texas GOP")
     assert "BEGIN:VEVENT" in calendar
     assert "Hall\\, Room A" in calendar
+
+
+def test_public_ics_event_parser_normalizes_utc() -> None:
+    body = b"""BEGIN:VCALENDAR
+BEGIN:VEVENT
+DTSTART:20260818T233000Z
+DTEND:20260819T010000Z
+SUMMARY:County Executive Committee Meeting
+LOCATION:Community Center\\, Room A
+URL:https://example.com/meeting
+END:VEVENT
+END:VCALENDAR"""
+    source = {
+        "name": "County GOP",
+        "region": "Houston",
+        "page": "https://example.com/calendar",
+    }
+    items = parse_ics_events(body, source)
+    assert items[0].starts_at == datetime(2026, 8, 18, 18, 30, tzinfo=CENTRAL)
+    assert items[0].venue == "Community Center, Room A"
 
 
 @pytest.mark.parametrize(

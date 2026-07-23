@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Iterable, TypeVar
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -38,6 +38,18 @@ T = TypeVar("T")
 LRL_X_DIRECTORY = "https://lrl.texas.gov/legeleaders/members/twitterDirectory.cfm"
 LRL_X_LIST = "https://twitter.com/TexasLRL/lists/TxLegislators"
 LRL_X_LIST_ID = "31904710"
+# X's public syndication endpoint — the same JSON the embed widgets read. No token required.
+X_SYNDICATION_TIMELINE = "https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle}"
+PUBLIC_FEED_MAX_ACCOUNTS = 8
+PUBLIC_FEED_CONCURRENCY = 3
+# Fallback handles used only when the LRL directory itself is unavailable.
+DEFAULT_X_HANDLES = (
+    "SenBryanHughes",
+    "leachfortexas",
+    "joanhuffman",
+    "DonnaCampbellTX",
+    "Burrows4TX",
+)
 TEC_FINANCE_XLSX = (
     "https://www.ethics.state.tx.us/data/search/cf/2026/2026_PACs_By_Total_Contribs.xlsx"
 )
@@ -111,9 +123,30 @@ EVENT_SOURCES = (
     {
         "name": "Republican Party of Texas",
         "region": "Statewide",
+        "kind": "tribe",
+        "url": "https://texasgop.org/wp-json/tribe/events/v1/events",
+        "page": "https://texasgop.org/events/",
+    },
+    {
+        "name": "Texas Federation of Republican Women",
+        "region": "Statewide",
         "kind": "html",
-        "url": "https://texasgop.org/",
-        "page": "https://texasgop.org/",
+        "url": "https://www.tfrw.org/events/?ical=1",
+        "page": "https://www.tfrw.org/events/",
+    },
+    {
+        "name": "Greater Houston Council of Republican Women",
+        "region": "Houston",
+        "kind": "html",
+        "url": "https://www.ghcfrwpac.org/events/",
+        "page": "https://www.ghcfrwpac.org/events/",
+    },
+    {
+        "name": "Montgomery County Republican Party",
+        "region": "Houston",
+        "kind": "ics",
+        "url": "https://www.calendarwiz.com/CalendarWiz_iCal.php?crd=mctxgop",
+        "page": "https://mctxgop.org/calendar",
     },
 )
 
@@ -136,7 +169,11 @@ ISSUE_TERMS = (
 class ResilientClient:
     """HTTP client with retries and an in-process last-good response store."""
 
-    def __init__(self, timeout: float = 8.0) -> None:
+    def __init__(
+        self,
+        timeout: float = 8.0,
+        status_forcelist: tuple[int, ...] = (429, 500, 502, 503, 504),
+    ) -> None:
         self.timeout = timeout
         self.session = requests.Session()
         retry = Retry(
@@ -144,7 +181,7 @@ class ResilientClient:
             connect=2,
             read=2,
             backoff_factor=0.35,
-            status_forcelist=(429, 500, 502, 503, 504),
+            status_forcelist=status_forcelist,
             allowed_methods=frozenset({"GET"}),
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
@@ -190,6 +227,9 @@ class ResilientClient:
 
 
 CLIENT = ResilientClient()
+# Public X syndication is aggressively rate-limited; retrying 429s only deepens the
+# limit, so this client does not retry them and falls back to its last-good response.
+SYNDICATION_CLIENT = ResilientClient(status_forcelist=(500, 502, 503, 504))
 
 
 def clean_text(value: str | None) -> str:
@@ -502,6 +542,111 @@ def fetch_x_list_posts(bearer_token: str, base_url: str) -> SourceResult[SocialP
     return _result("X legislator list", source_url, posts, stale, latency, error)
 
 
+def _parse_twitter_datetime(value: str | None) -> datetime | None:
+    """Parse X's timeline timestamp, e.g. 'Sat Jul 04 12:33:41 +0000 2026'."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%a %b %d %H:%M:%S %z %Y")
+    except (TypeError, ValueError):
+        return None
+    return parsed.astimezone(CENTRAL)
+
+
+def parse_syndication_timeline(
+    body: bytes, account: LegislatorSocialAccount, limit: int = 3
+) -> list[SocialPost]:
+    """Extract original posts from a public syndication timeline page (no auth)."""
+    match = re.search(
+        rb'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', body, re.S
+    )
+    if not match:
+        return []
+    payload = requests.models.complexjson.loads(match.group(1))
+    timeline = (payload.get("props", {}).get("pageProps", {}) or {}).get("timeline", {}) or {}
+    posts: list[SocialPost] = []
+    for entry in timeline.get("entries", []):
+        if entry.get("type") != "tweet":
+            continue
+        tweet = (entry.get("content") or {}).get("tweet") or {}
+        # Keep original posts only — skip retweets and replies.
+        if not tweet or tweet.get("retweeted_status") or tweet.get("in_reply_to_status_id_str"):
+            continue
+        tweet_id = tweet.get("id_str")
+        if not tweet_id:
+            continue
+        user = tweet.get("user") or {}
+        handle = user.get("screen_name") or account.handle
+        posts.append(
+            SocialPost(
+                legislator_name=account.name or user.get("name") or handle,
+                handle=handle,
+                text=clean_text(tweet.get("full_text") or tweet.get("text") or ""),
+                url=f"https://x.com/{handle}/status/{tweet_id}",
+                created_at=_parse_twitter_datetime(tweet.get("created_at")),
+                likes=int(tweet.get("favorite_count") or 0),
+                reposts=int(tweet.get("retweet_count") or 0),
+            )
+        )
+        if len(posts) >= limit:
+            break
+    return posts
+
+
+def _syndication_account_posts(
+    account: LegislatorSocialAccount, per_account: int
+) -> tuple[list[SocialPost], bool, int]:
+    url = X_SYNDICATION_TIMELINE.format(handle=quote(account.handle, safe=""))
+    body, stale, latency, _error = SYNDICATION_CLIENT.get(
+        url, headers={"Accept": "text/html,application/xhtml+xml"}
+    )
+    if not body:
+        return [], stale, latency
+    try:
+        return parse_syndication_timeline(body, account, per_account), stale, latency
+    except (ValueError, KeyError, TypeError):
+        return [], stale, latency
+
+
+def fetch_public_legislator_posts(
+    accounts: list[LegislatorSocialAccount],
+    max_accounts: int = PUBLIC_FEED_MAX_ACCOUNTS,
+    per_account: int = 3,
+    total: int = 24,
+) -> SourceResult[SocialPost]:
+    """Merge recent original posts for a bounded set of legislators — no token needed."""
+    source_url = LRL_X_LIST
+    selected = accounts[:max_accounts]
+    if not selected:
+        return SourceResult(
+            source_name="X public timeline",
+            source_url=source_url,
+            fetched_at=NOW(),
+            freshness="unavailable",
+            error="No legislator accounts are available for the public feed.",
+        )
+    posts: list[SocialPost] = []
+    stale = False
+    latency = 0
+    with ThreadPoolExecutor(max_workers=min(PUBLIC_FEED_CONCURRENCY, len(selected))) as executor:
+        futures = [
+            executor.submit(_syndication_account_posts, account, per_account)
+            for account in selected
+        ]
+        for future in as_completed(futures):
+            try:
+                account_posts, account_stale, account_latency = future.result()
+            except Exception:
+                continue
+            posts.extend(account_posts)
+            stale = stale or account_stale
+            latency = max(latency, account_latency)
+    posts.sort(key=lambda item: item.created_at.timestamp() if item.created_at else 0, reverse=True)
+    posts = posts[:total]
+    error = "" if posts else "No public posts were returned for the selected legislators."
+    return _result("X public timeline", source_url, posts, stale, latency, error)
+
+
 def parse_finance_workbook(body: bytes, source_url: str) -> list[FinanceSummary]:
     workbook = pd.ExcelFile(io.BytesIO(body), engine="openpyxl")
     sheet_name = workbook.sheet_names[0]
@@ -789,11 +934,20 @@ def fetch_tribe_events(source: dict[str, str]) -> SourceResult[PoliticalEvent]:
             for raw in payload.get("events", []):
                 venue = raw.get("venue") or {}
                 title = clean_text(raw.get("title", ""))
+                organizers = raw.get("organizer") or []
+                organizer = next(
+                    (
+                        clean_text(value.get("organizer", ""))
+                        for value in organizers
+                        if isinstance(value, dict) and value.get("organizer")
+                    ),
+                    source["name"],
+                )
                 items.append(
                     PoliticalEvent(
                         title=title,
                         region=source["region"],
-                        organizer=source["name"],
+                        organizer=organizer,
                         event_type=_event_type(title),
                         url=raw.get("url", source["page"]),
                         starts_at=safe_datetime(raw.get("start_date")),
@@ -812,38 +966,145 @@ def fetch_tribe_events(source: dict[str, str]) -> SourceResult[PoliticalEvent]:
     return _result(source["name"], source["page"], items, stale, latency, error)
 
 
+def _event_datetime(date_text: str, time_text: str = "") -> datetime | None:
+    cleaned_date = clean_text(date_text)
+    cleaned_time = clean_text(time_text).upper().replace(".", "")
+    match = re.search(
+        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?[,]?\s*"
+        r"((?:January|February|March|April|May|June|July|August|September|October|November|December)"
+        r"\s+\d{1,2},\s+\d{4})",
+        cleaned_date,
+        re.I,
+    )
+    if not match:
+        return None
+    for pattern in ("%B %d, %Y %I:%M%p", "%B %d, %Y %I%p"):
+        try:
+            return datetime.strptime(
+                f"{match.group(1).title()} {cleaned_time.replace(' ', '')}", pattern
+            ).replace(tzinfo=CENTRAL)
+        except ValueError:
+            continue
+    try:
+        return datetime.strptime(match.group(1).title(), "%B %d, %Y").replace(tzinfo=CENTRAL)
+    except ValueError:
+        return None
+
+
 def fetch_html_events(source: dict[str, str]) -> SourceResult[PoliticalEvent]:
     body, stale, latency, error = CLIENT.get(source["url"])
     items: list[PoliticalEvent] = []
     if body:
         try:
             soup = BeautifulSoup(body, "html.parser")
-            candidates = soup.select("article, .event, .tribe-events-calendar-list__event-row")
+            candidates = soup.select(
+                "article, .event:not(.calendar), .tribe-events-calendar-list__event-row, "
+                "[class*='adrsscntnt']"
+            )
             for node in candidates[:60]:
-                anchor = node.select_one("h1 a, h2 a, h3 a, h4 a, a[href]")
-                if not anchor:
-                    continue
-                title = clean_text(anchor.get_text())
+                title_node = node.select_one(
+                    ".event-title, h1, h2, h3, h4, h5, h6, "
+                    ".tribe-events-calendar-list__event-title"
+                )
+                anchor = (
+                    title_node.select_one("a[href]")
+                    if title_node
+                    else node.select_one("a[href]")
+                ) or node.select_one(".event-link a[href], a[href]")
+                title = clean_text(title_node.get_text(" ", strip=True)) if title_node else ""
+                if not title and anchor:
+                    title = clean_text(anchor.get_text(" ", strip=True))
                 if len(title) < 5:
                     continue
                 time_node = node.select_one("time")
-                starts = safe_datetime(
-                    time_node.get("datetime") if time_node else None
-                )
+                date_node = node.select_one(".event-date, [class*='date']")
+                hours_node = node.select_one(".event-hours, [class*='time']")
+                starts = safe_datetime(time_node.get("datetime")) if time_node else None
+                if not starts:
+                    starts = _event_datetime(
+                        date_node.get_text(" ", strip=True) if date_node else node.get_text(" ", strip=True),
+                        hours_node.get_text(" ", strip=True) if hours_node else "",
+                    )
+                if not starts:
+                    continue
                 if starts and starts < NOW() - timedelta(days=1):
                     continue
+                venue_node = node.select_one(".event-venue, [class*='venue']")
                 items.append(
                     PoliticalEvent(
                         title=title,
                         region=source["region"],
                         organizer=source["name"],
                         event_type=_event_type(title),
-                        url=urljoin(source["url"], anchor.get("href", source["page"])),
+                        url=urljoin(
+                            source["url"],
+                            anchor.get("href", source["page"]) if anchor else source["page"],
+                        ),
                         starts_at=starts,
+                        venue=clean_text(venue_node.get_text(" ", strip=True)) if venue_node else "",
                     )
                 )
         except Exception:
             error = "The event page format could not be read."
+    return _result(source["name"], source["page"], items, stale, latency, error)
+
+
+def _ics_value(lines: list[str], key: str) -> str:
+    for line in lines:
+        field = line.split(":", 1)[0].split(";", 1)[0].upper()
+        if field == key and ":" in line:
+            return line.split(":", 1)[1]
+    return ""
+
+
+def _ics_datetime(value: str) -> datetime | None:
+    value = value.strip()
+    for pattern in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(value, pattern)
+            if pattern.endswith("Z"):
+                return parsed.replace(tzinfo=ZoneInfo("UTC")).astimezone(CENTRAL)
+            return parsed.replace(tzinfo=CENTRAL)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_ics_events(body: bytes, source: dict[str, str]) -> list[PoliticalEvent]:
+    text = body.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    text = re.sub(r"\n[ \t]", "", text)
+    output: list[PoliticalEvent] = []
+    for block in re.findall(r"BEGIN:VEVENT\n(.*?)\nEND:VEVENT", text, re.S):
+        lines = block.splitlines()
+        title = clean_text(_ics_value(lines, "SUMMARY").replace("\\,", ",").replace("\\n", " "))
+        starts = _ics_datetime(_ics_value(lines, "DTSTART"))
+        if not title or not starts or starts < NOW() - timedelta(days=1):
+            continue
+        location = clean_text(_ics_value(lines, "LOCATION").replace("\\,", ",").replace("\\n", " "))
+        url = _ics_value(lines, "URL") or source["page"]
+        output.append(
+            PoliticalEvent(
+                title=title,
+                region=source["region"],
+                organizer=source["name"],
+                event_type=_event_type(title),
+                url=url if url.startswith("https://") else source["page"],
+                starts_at=starts,
+                ends_at=_ics_datetime(_ics_value(lines, "DTEND")),
+                venue=location,
+            )
+        )
+    return output
+
+
+def fetch_ics_events(source: dict[str, str]) -> SourceResult[PoliticalEvent]:
+    body, stale, latency, error = CLIENT.get(source["url"])
+    items: list[PoliticalEvent] = []
+    if body:
+        try:
+            items = parse_ics_events(body, source)
+        except Exception:
+            error = "The calendar feed format could not be read."
     return _result(source["name"], source["page"], items, stale, latency, error)
 
 
@@ -852,6 +1113,8 @@ def fetch_events() -> list[SourceResult[PoliticalEvent]]:
     for source in EVENT_SOURCES:
         if source["kind"] == "tribe":
             calls.append((source["name"], lambda s=source: fetch_tribe_events(s)))
+        elif source["kind"] == "ics":
+            calls.append((source["name"], lambda s=source: fetch_ics_events(s)))
         else:
             calls.append((source["name"], lambda s=source: fetch_html_events(s)))
     return _parallel(calls)
