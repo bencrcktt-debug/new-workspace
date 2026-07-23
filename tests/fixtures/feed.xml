@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Texas activity</title>
+    <item>
+      <title>HB 1 - Filed</title>
+      <description><![CDATA[<b>Relating to property tax relief.</b>]]></description>
+      <link>https://capitol.texas.gov/example</link>
+      <pubDate>Thu, 23 Jul 2026 10:00:00 -0500</pubDate>
+    </item>
+  </channel>
+</rss>
