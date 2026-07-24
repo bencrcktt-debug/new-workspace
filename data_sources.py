@@ -49,6 +49,7 @@ X_SYNDICATION_TIMELINE = "https://syndication.twitter.com/srv/timeline-profile/s
 # burst-sensitive: parallel request waves draw 429s well under the quota, so the
 # public feed fetches sequentially with a politeness delay between requests.
 PUBLIC_FEED_MAX_ACCOUNTS = 6
+PUBLIC_INDEX_MAX_ACCOUNTS = 18
 PUBLIC_FEED_CONCURRENCY = 1
 # Fallback handles used only when the LRL directory itself is unavailable.
 DEFAULT_X_HANDLES = (
@@ -62,7 +63,7 @@ TEC_FINANCE_XLSX = (
     "https://www.ethics.state.tx.us/data/search/cf/2026/2026_PACs_By_Total_Contribs.xlsx"
 )
 TEC_FINANCE_HOME = "https://www.ethics.state.tx.us/search/cf/"
-TRIBUNE_FEED = "https://www.texastribune.org/topics/politics/feed/"
+TRIBUNE_FEED = "https://feeds.texastribune.org/feeds/main/"
 DIRECT_NEWS_FEEDS = {
     "Texas Scorecard": "https://texasscorecard.com/feed/",
     "Current Revolt": "https://www.currentrevolt.com/feed",
@@ -90,6 +91,8 @@ GOOGLE_NEWS_FEEDS = {
 TLO_FEEDS = {
     "House bills filed": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysfiledhouse",
     "Senate bills filed": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysfiledsenate",
+    "House calendars": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=upcomingcalendarshouse",
+    "Senate calendars": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=upcomingcalendarssenate",
     "Passed bills": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysbillspassed",
     "Bill text": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysbilltext",
 }
@@ -905,13 +908,15 @@ def _indexed_account_posts(
 def fetch_public_legislator_posts(
     accounts: list[LegislatorSocialAccount],
     max_accounts: int = PUBLIC_FEED_MAX_ACCOUNTS,
+    indexed_max_accounts: int = PUBLIC_INDEX_MAX_ACCOUNTS,
     per_account: int = 3,
     total: int = 24,
 ) -> SourceResult[SocialPost]:
-    """Merge recent original posts for a bounded set of legislators — no token needed."""
+    """Merge direct and indexed public posts without requiring an X token."""
     source_url = LRL_X_LIST
-    selected = accounts[:max_accounts]
-    if not selected:
+    syndication_selected = accounts[:max_accounts]
+    indexed_selected = accounts[:indexed_max_accounts]
+    if not indexed_selected:
         return SourceResult(
             source_name="X public timeline",
             source_url=source_url,
@@ -928,10 +933,12 @@ def fetch_public_legislator_posts(
     # The syndication endpoint supplies direct links and engagement counts, but can
     # return a pinned/old timeline or hit X's anonymous quota. A public search index
     # supplies recent status pages without credentials, so merge both paths.
-    with ThreadPoolExecutor(max_workers=min(PUBLIC_FEED_CONCURRENCY, len(selected))) as executor:
+    with ThreadPoolExecutor(
+        max_workers=min(PUBLIC_FEED_CONCURRENCY, len(syndication_selected))
+    ) as executor:
         futures = [
             executor.submit(_syndication_account_posts, account, per_account)
-            for account in selected
+            for account in syndication_selected
         ]
         for future in as_completed(futures):
             try:
@@ -941,10 +948,10 @@ def fetch_public_legislator_posts(
             syndication_posts.extend(account_posts)
             syndication_stale = syndication_stale or account_stale
             latency = max(latency, account_latency)
-    with ThreadPoolExecutor(max_workers=min(4, len(selected))) as executor:
+    with ThreadPoolExecutor(max_workers=min(6, len(indexed_selected))) as executor:
         futures = [
             executor.submit(_indexed_account_posts, account, per_account)
-            for account in selected
+            for account in indexed_selected
         ]
         for future in as_completed(futures):
             try:
@@ -984,7 +991,7 @@ def fetch_public_legislator_posts(
             )
         else:
             error = "No public posts were returned for the selected legislators."
-    return _result("X public/indexed timelines", source_url, posts, stale, latency, error)
+    return _result("X public + indexed timelines", source_url, posts, stale, latency, error)
 
 
 def parse_finance_workbook(body: bytes, source_url: str) -> list[FinanceSummary]:
@@ -1056,7 +1063,7 @@ def fetch_headline_feed(name: str, url: str) -> SourceResult[Headline]:
                     publisher = "The Texas Tribune"
                 elif name in DIRECT_NEWS_FEEDS:
                     publisher = name
-                if name in GOOGLE_NEWS_FEEDS and not is_texas_political_story(
+                if (name in GOOGLE_NEWS_FEEDS or name == "Texas Tribune") and not is_texas_political_story(
                     title, entry["summary"]
                 ):
                     continue
@@ -1509,7 +1516,20 @@ def fetch_events() -> list[SourceResult[PoliticalEvent]]:
 def dedupe_events(results: Iterable[SourceResult[PoliticalEvent]]) -> list[PoliticalEvent]:
     seen: set[str] = set()
     items: list[PoliticalEvent] = []
+    now = NOW()
     for item in [x for result in results for x in result.items]:
+        if item.starts_at:
+            local_start = item.starts_at.astimezone(CENTRAL)
+            is_all_day_today = (
+                local_start.date() == now.date()
+                and local_start.hour == 0
+                and local_start.minute == 0
+            )
+            is_ongoing = bool(
+                item.ends_at and item.ends_at.astimezone(CENTRAL) >= now
+            )
+            if local_start < now and not is_all_day_today and not is_ongoing:
+                continue
         day = item.starts_at.date().isoformat() if item.starts_at else "unknown"
         key = re.sub(r"[^a-z0-9]", "", item.title.lower())[:80] + day
         if key in seen:

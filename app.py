@@ -13,6 +13,7 @@ from data_sources import (
     DEFAULT_X_HANDLES,
     LRL_X_LIST,
     PUBLIC_FEED_MAX_ACCOUNTS,
+    PUBLIC_INDEX_MAX_ACCOUNTS,
     TEC_FINANCE_HOME,
     dedupe_events,
     dedupe_headlines,
@@ -236,6 +237,22 @@ def inject_css() -> None:
         .chart-bar-line{display:flex;align-items:center;gap:7px;margin:2px 0}
         .chart-bar{height:11px;border-radius:0 3px 3px 0;min-width:2px;display:inline-block;flex:none}
         .chart-value{font-family:'IBM Plex Mono',monospace;font-size:9px;color:#52514e;white-space:nowrap}
+        .briefing-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;padding:16px 2px 11px}
+        .briefing-date{font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:#8e2932;font-weight:600}
+        .briefing-title{font-family:'Libre Caslon Text',Georgia,serif;font-size:34px;line-height:1.08;color:#172435;margin-top:4px}
+        .briefing-copy{font-size:11px;line-height:1.55;color:#687583;max-width:560px;text-align:right}
+        .coverage-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid #c9d0d7;background:#f8fafb;margin:11px 0 12px}
+        .coverage-cell{padding:10px 13px;border-right:1px solid #d7dde2;min-width:0}.coverage-cell:last-child{border-right:0}
+        .coverage-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+        .coverage-name{font-family:'IBM Plex Mono';font-size:8px;letter-spacing:.1em;text-transform:uppercase;color:#4f5c69;font-weight:600}
+        .coverage-state{font-family:'IBM Plex Mono';font-size:7px;text-transform:uppercase;color:#6f7b87;white-space:nowrap}
+        .coverage-value{font-family:'Libre Caslon Text';font-size:18px;font-weight:700;color:#213142;margin-top:4px}
+        .coverage-note{font-size:8px;color:#798590;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .coverage-state:before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;background:#a3acb7}
+        .coverage-state.live:before{background:#16805a}.coverage-state.cached:before{background:#3374aa}
+        .coverage-state.stale:before{background:#d48712}.coverage-state.unavailable:before{background:#a3acb7}
+        a:focus-visible,button:focus-visible{outline:3px solid #d99b31!important;outline-offset:2px}
+        .record-title a:hover,.priority-title a:hover,.headline-copy a:hover,.field-title a:hover,.agenda-title a:hover{text-decoration:underline}
         @media(max-width:700px){
           .block-container{padding:.7rem .75rem 8rem}.topbar{align-items:flex-start}.asof{display:none}
           .star{width:35px;height:35px}.brand-title{font-size:16px}.hero{padding:21px 18px;border-radius:17px}
@@ -257,6 +274,9 @@ def inject_css() -> None:
           .lower-grid{grid-template-columns:1fr}
           .agenda-items{grid-template-columns:1fr}.agenda-item:nth-child(odd){border-right:0}
           .chart-row{grid-template-columns:1fr;gap:3px}.chart-name{white-space:normal}
+          .briefing-head{display:block}.briefing-title{font-size:28px}.briefing-copy{text-align:left;margin-top:7px}
+          .coverage-grid{grid-template-columns:repeat(2,1fr)}.coverage-cell:nth-child(2){border-right:0}
+          .coverage-cell:nth-child(-n+2){border-bottom:1px solid #d7dde2}
           div[data-testid="stPills"],div[data-testid="stButtonGroup"]{left:8px;right:8px;bottom:8px;transform:none;width:auto;padding:6px}
           div[data-testid="stPills"] button,div[data-testid="stButtonGroup"] button{font-size:9px;min-height:38px}
         }
@@ -345,7 +365,14 @@ def public_feed_accounts(
         by_handle = {a.handle.lower(): a for a in directory_items}
         ordered = [by_handle[h.lower()] for h in default_handles if h.lower() in by_handle]
         seen = {a.handle.lower() for a in ordered}
-        for account in directory_items:
+        remaining = sorted(
+            (account for account in directory_items if account.handle.lower() not in seen),
+            key=lambda account: account.handle.lower(),
+        )
+        if remaining:
+            offset = TODAY.toordinal() % len(remaining)
+            remaining = remaining[offset:] + remaining[:offset]
+        for account in remaining:
             if account.handle.lower() not in seen:
                 ordered.append(account)
                 seen.add(account.handle.lower())
@@ -355,7 +382,7 @@ def public_feed_accounts(
             LegislatorSocialAccount(name=h, chamber="", handle=h, profile_url=f"https://x.com/{h}")
             for h in handles
         ]
-    return ordered[:PUBLIC_FEED_MAX_ACCOUNTS]
+    return ordered[:PUBLIC_INDEX_MAX_ACCOUNTS]
 
 
 def remember(results: SourceResult | Iterable[SourceResult]) -> None:
@@ -638,13 +665,51 @@ def priority_news_panel(headlines: list[Headline], limit: int = 5) -> str:
     rows = []
     for index, item in enumerate(selected, 1):
         topics = ", ".join(extract_topics(f"{item.title} {item.summary}")) or "Texas politics"
+        score = headline_priority(item)
+        signal = "High" if score >= 22 else "Strong" if score >= 16 else "Monitor"
         rows.append(
             f"""<div class="priority-row"><span class="priority-index">0{index}</span><div>
             <div class="priority-title"><a href="{safe_url(item.url)}" target="_blank">{escape(item.title)} ↗</a></div>
             <div class="priority-meta">{escape(item.publisher)} · {escape(compact_age(item.published_at))} ago · {escape(topics)}</div></div>
-            <span class="priority-score">Signal {headline_priority(item):.0f}</span></div>"""
+            <span class="priority-score">{signal} priority</span></div>"""
         )
     return f'<div class="priority-stack">{"".join(rows)}</div>'
+
+
+def source_coverage_panel(
+    hearings: list[SourceResult],
+    headlines: list[SourceResult],
+    events: list[SourceResult],
+    directory: SourceResult,
+    posts: SourceResult,
+) -> str:
+    """Compact provenance and freshness summary for the command center."""
+    groups = [
+        ("Official legislature", hearings, "Texas Legislature Online"),
+        ("Texas reporting", headlines, "Direct + indexed coverage"),
+        ("Field calendars", events, "State, county, and clubs"),
+        ("Legislator pulse", [directory, posts], "LRL + public X paths"),
+    ]
+    cells = []
+    for name, results, note in groups:
+        responding = [result for result in results if result.freshness != "unavailable"]
+        records = sum(len(result.items) for result in results)
+        if any(result.freshness == "live" for result in results):
+            state = "live"
+        elif any(result.freshness == "cached" for result in results):
+            state = "cached"
+        elif any(result.freshness == "stale" for result in results):
+            state = "stale"
+        else:
+            state = "unavailable"
+        cells.append(
+            f"""<div class="coverage-cell"><div class="coverage-top">
+            <span class="coverage-name">{escape(name)}</span>
+            <span class="coverage-state {state}">{escape(state)}</span></div>
+            <div class="coverage-value">{records} records</div>
+            <div class="coverage-note">{len(responding)}/{len(results)} sources · {escape(note)}</div></div>"""
+        )
+    return f'<div class="coverage-grid">{"".join(cells)}</div>'
 
 
 def field_calendar_panel(events: list[PoliticalEvent]) -> str:
@@ -771,6 +836,18 @@ def load_command_data() -> tuple[list[SourceResult], list[SourceResult], list[So
 
 
 def command_center() -> None:
+    period = "Morning" if datetime.now(CENTRAL).hour < 12 else "Afternoon"
+    st.markdown(
+        f"""<div class="briefing-head"><div><div class="briefing-date">
+        {escape(TODAY.strftime('%A · %B %d, %Y').replace(' 0', ' '))}</div>
+        <div class="briefing-title">{period} intelligence brief</div></div>
+        <div class="briefing-copy">Official legislative records, attributed reporting, field calendars,
+        and public legislator posts — ranked for fast review and linked to the source record.</div></div>""",
+        unsafe_allow_html=True,
+    )
+    if st.button("Refresh intelligence", help="Clear source caches and request current public data"):
+        st.cache_data.clear()
+        st.rerun()
     token = configured_x_token()
     base_url = str(get_secret("X_API_BASE_URL", "https://api.x.com") or "https://api.x.com")
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -802,6 +879,12 @@ def command_center() -> None:
     events = dedupe_events(event_results)
     all_results = [*hearing_results, *headline_results, *event_results, directory, posts]
     responding = sum(1 for result in all_results if result.freshness != "unavailable")
+    st.markdown(
+        source_coverage_panel(
+            hearing_results, headline_results, event_results, directory, posts
+        ),
+        unsafe_allow_html=True,
+    )
     countdown_strip()
     operations_strip(hearings, headlines, events)
     st.markdown(
@@ -1092,20 +1175,33 @@ def headlines_page() -> None:
             "responding now",
         )
     publishers = ["All"] + sorted({x.publisher for x in items})
-    c1, c2, c3, c4 = st.columns([1.4, 1, 1, 2])
+    topics = sorted(
+        {
+            topic
+            for item in items
+            for topic in extract_topics(f"{item.title} {item.summary}")
+        }
+    )
+    c1, c2, c3, c4, c5 = st.columns([1.25, 1, 1, 1.15, 1.8])
     with c1:
         publisher = st.selectbox("Publisher", publishers)
     with c2:
         window = st.selectbox("Window", ["Any time", "24 hours", "3 days", "7 days"])
     with c3:
-        ordering = st.selectbox("Sort", ["Priority brief", "Newest first"])
+        issue = st.selectbox("Issue", ["All issues"] + topics)
     with c4:
+        ordering = st.selectbox("Sort", ["Priority brief", "Newest first"])
+    with c5:
         query = st.text_input("Search headlines", placeholder="Issue, official, county, or race")
     window_hours = {"24 hours": 24, "3 days": 72, "7 days": 168}.get(window)
     cutoff = now - timedelta(hours=window_hours) if window_hours else None
     shown = [
         x for x in items
         if (publisher == "All" or x.publisher == publisher)
+        and (
+            issue == "All issues"
+            or issue in extract_topics(f"{x.title} {x.summary}")
+        )
         and (not query or query.lower() in f"{x.title} {x.summary}".lower())
         and (cutoff is None or (x.published_at and x.published_at >= cutoff))
     ]
@@ -1130,6 +1226,13 @@ def headlines_page() -> None:
             headline_card(item)
     else:
         empty_state("No headlines match these filters.")
+    with st.expander("News sources and freshness"):
+        st.caption(
+            "Direct publisher feeds are supplemented by tightly scoped seven-day indexes. "
+            "Every headline retains its named publisher and source link."
+        )
+        for result in sorted(results, key=lambda x: x.source_name):
+            status_line(result)
 
 
 def social_page() -> None:
@@ -1173,6 +1276,7 @@ def social_page() -> None:
         if (chamber == "All" or x.chamber == chamber)
         and (not query or query.lower() in f"{x.name} {x.handle}".lower())
     ]
+    token = configured_x_token()
     defaults = get_secret(
         "SOCIAL_DEFAULT_HANDLES",
         get_secret("TXLEGE_X_HANDLES", []),
@@ -1183,32 +1287,38 @@ def social_page() -> None:
     default_accounts = [x for x in filtered if x.handle.lower() in default_handles][:10]
     if not default_accounts:
         default_accounts = filtered[:PUBLIC_FEED_MAX_ACCOUNTS]
+    if not token:
+        default_accounts = public_feed_accounts(filtered)
     options = {f"{x.name} · @{x.handle}": x for x in filtered}
     default_labels = [
-        label for label, account in options.items() if account.handle.lower() in default_handles
+        label for label, account in options.items() if account in default_accounts
     ]
+    account_limit = 10 if token else PUBLIC_INDEX_MAX_ACCOUNTS
     selected_labels = st.multiselect(
-        "Tracked accounts (maximum 10)",
+        f"Tracked accounts (maximum {account_limit})",
         list(options),
         default=default_labels,
-        max_selections=10,
+        max_selections=account_limit,
     )
     selected = [options[label] for label in selected_labels] or default_accounts
-    token = configured_x_token()
     base_url = str(get_secret("X_API_BASE_URL", "https://api.x.com") or "https://api.x.com")
     tab_feed, tab_directory = st.tabs(["Recent posts", f"Directory ({len(filtered)})"])
     with tab_feed:
         if token:
             posts = live_posts(token, base_url, tuple(selected))
             if not posts.items:
-                posts = live_public_posts(tuple(selected[:PUBLIC_FEED_MAX_ACCOUNTS]))
+                posts = live_public_posts(tuple(selected))
         else:
-            posts = live_public_posts(tuple(selected[:PUBLIC_FEED_MAX_ACCOUNTS]))
+            posts = live_public_posts(tuple(selected))
         remember(posts)
         if posts.items:
             status_line(posts)
             if not token:
-                st.caption("Reading public timelines and indexed public status pages — no token required.")
+                st.caption(
+                    f"No token required: direct public timelines cover up to {PUBLIC_FEED_MAX_ACCOUNTS} "
+                    f"accounts and public indexes broaden coverage to {PUBLIC_INDEX_MAX_ACCOUNTS}. "
+                    "Results refresh every 30 minutes."
+                )
             for post in posts.items:
                 st.markdown(
                     f"""<div class="record"><div class="record-top"><span class="tag tag-blue">
@@ -1291,6 +1401,7 @@ def events_page() -> None:
         and (organizer == "All" or x.organizer == organizer)
         and (not query or query.lower() in f"{x.title} {x.organizer} {x.venue}".lower())
         and x.starts_at
+        and x.starts_at.astimezone(CENTRAL).date() >= TODAY
         and x.starts_at.astimezone(CENTRAL).date() <= TODAY + timedelta(days=horizon)
     ]
     if shown:
@@ -1304,6 +1415,10 @@ def events_page() -> None:
     else:
         empty_state("No upcoming events match these filters.")
     with st.expander("Connected sources and status"):
+        st.caption(
+            "A live source with zero records is online but has no dated upcoming events. "
+            "Open any source to confirm undated notices or late calendar changes."
+        )
         for result in sorted(results, key=lambda x: x.source_name):
             status_line(result)
             st.link_button(f"Open {result.source_name} ↗", result.source_url)
@@ -1346,7 +1461,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-pages = ["Command center", "Legislature", "Campaign finance", "Media", "GOP calendar", "Source health"]
+pages = [
+    "Command center",
+    "Legislature",
+    "Campaign finance",
+    "Media",
+    "Legislators on X",
+    "GOP calendar",
+    "Source health",
+]
 if st.session_state.get("bottom_navigation") not in pages:
     st.session_state["bottom_navigation"] = "Command center"
 page = st.session_state["bottom_navigation"]
@@ -1359,6 +1482,8 @@ elif page == "Campaign finance":
     finance_page()
 elif page == "Media":
     headlines_page()
+elif page == "Legislators on X":
+    social_page()
 elif page == "GOP calendar":
     events_page()
 else:

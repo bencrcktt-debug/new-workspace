@@ -11,6 +11,7 @@ def test_all_navigation_sections_render() -> None:
         "Legislature",
         "Campaign finance",
         "Media",
+        "Legislators on X",
         "GOP calendar",
         "Source health",
     ]

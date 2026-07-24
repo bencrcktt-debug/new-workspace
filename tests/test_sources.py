@@ -13,6 +13,8 @@ import pytest
 import requests
 
 from data_sources import (
+    TLO_FEEDS,
+    TRIBUNE_FEED,
     SyndicationClient,
     _feed_entries,
     dedupe_events,
@@ -271,6 +273,39 @@ def test_public_feed_merges_and_sorts_accounts(monkeypatch: pytest.MonkeyPatch) 
     assert timestamps == sorted(timestamps, reverse=True)
 
 
+def test_public_feed_broadens_index_coverage_without_more_x_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    direct: list[str] = []
+    indexed: list[str] = []
+
+    def fake_direct(account: LegislatorSocialAccount, _limit: int):
+        direct.append(account.handle)
+        return [], False, 1
+
+    def fake_indexed(account: LegislatorSocialAccount, _limit: int):
+        indexed.append(account.handle)
+        return [], False, 1
+
+    monkeypatch.setattr("data_sources._syndication_account_posts", fake_direct)
+    monkeypatch.setattr("data_sources._indexed_account_posts", fake_indexed)
+    accounts = [
+        LegislatorSocialAccount(f"Member {i}", "House", f"handle{i}", f"https://x.com/handle{i}")
+        for i in range(24)
+    ]
+
+    fetch_public_legislator_posts(accounts)
+
+    assert len(direct) == 6
+    assert len(indexed) == 18
+
+
+def test_documented_primary_feeds_are_configured() -> None:
+    assert TRIBUNE_FEED == "https://feeds.texastribune.org/feeds/main/"
+    assert "House calendars" in TLO_FEEDS
+    assert "Senate calendars" in TLO_FEEDS
+
+
 def test_indexed_x_feed_provides_recent_no_token_posts() -> None:
     account = LegislatorSocialAccount(
         "Dustin Burrows", "House", "Burrows4TX", "https://x.com/Burrows4TX"
@@ -407,6 +442,36 @@ def test_events_dedupe_and_ics_escape() -> None:
     calendar = make_ics([event], "Texas GOP")
     assert "BEGIN:VEVENT" in calendar
     assert "Hall\\, Room A" in calendar
+
+
+def test_calendar_excludes_events_that_already_ended_their_start_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "data_sources.NOW",
+        lambda: datetime(2026, 8, 1, 15, tzinfo=CENTRAL),
+    )
+    past = PoliticalEvent(
+        "Past luncheon",
+        "Austin",
+        "County GOP",
+        "Club meeting",
+        "https://example.com/past",
+        datetime(2026, 8, 1, 12, tzinfo=CENTRAL),
+    )
+    upcoming = PoliticalEvent(
+        "Evening reception",
+        "Austin",
+        "County GOP",
+        "Fundraiser",
+        "https://example.com/upcoming",
+        datetime(2026, 8, 1, 18, tzinfo=CENTRAL),
+    )
+    from models import SourceResult
+
+    assert dedupe_events([SourceResult("events", "https://example.com", [past, upcoming])]) == [
+        upcoming
+    ]
 
 
 def test_public_ics_event_parser_normalizes_utc() -> None:
