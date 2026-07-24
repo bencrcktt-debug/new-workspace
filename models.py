@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Generic, Literal, TypeVar
+from typing import Generic, Iterable, Literal, TypeVar
 
 
 Freshness = Literal["live", "cached", "stale", "unavailable"]
@@ -96,6 +96,14 @@ class Milestone:
     occurs_on: date
     category: str
     source_url: str
+
+
+def next_milestones(
+    milestones: Iterable[Milestone], today: date, count: int = 4
+) -> list[Milestone]:
+    upcoming = [item for item in milestones if item.occurs_on >= today]
+    upcoming.sort(key=lambda item: item.occurs_on)
+    return upcoming[:count]
 
 
 def milestone_status(occurs_on: date, today: date) -> tuple[str, int]:

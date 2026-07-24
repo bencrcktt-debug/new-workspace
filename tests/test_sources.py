@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -9,25 +10,43 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
+import requests
 
 from data_sources import (
+    SyndicationClient,
     _feed_entries,
     dedupe_events,
     dedupe_headlines,
+    extract_topics,
     fetch_hearing_feed,
+    fetch_html_events,
     fetch_public_legislator_posts,
+    fetch_headline_feed,
     fetch_social_posts,
     fetch_x_list_posts,
+    headline_relevance,
+    headline_priority,
+    is_texas_political_story,
+    make_briefing,
     make_ics,
     parse_bullpen_daily,
     parse_finance_workbook,
     parse_ics_events,
     parse_lrl_directory,
+    parse_indexed_x_posts,
     parse_syndication_timeline,
     parse_texan_headlines,
     safe_datetime,
 )
-from models import Headline, LegislatorSocialAccount, PoliticalEvent, milestone_status
+from models import (
+    Headline,
+    Hearing,
+    LegislatorSocialAccount,
+    Milestone,
+    PoliticalEvent,
+    milestone_status,
+    next_milestones,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -165,6 +184,69 @@ def test_syndication_timeline_keeps_only_original_posts() -> None:
     assert posts[0].created_at == datetime(2026, 7, 22, 10, 30, tzinfo=CENTRAL)
 
 
+def _fake_response(status: int, body: bytes = b"", headers: dict | None = None) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response._content = body
+    response.url = "https://syndication.twitter.com/test"
+    if headers:
+        response.headers.update(headers)
+    return response
+
+
+def test_syndication_client_gates_after_429_and_serves_last_good(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = SyndicationClient(cache_dir=str(tmp_path))
+    reset_at = str(time.time() + 600)
+    responses = [
+        _fake_response(200, b"payload"),
+        _fake_response(429, b"Rate limit exceeded", {"x-rate-limit-reset": reset_at}),
+    ]
+    calls: list[str] = []
+
+    def fake_get(url: str, headers=None, timeout=None):
+        calls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr(client.session, "get", fake_get)
+    url = "https://syndication.twitter.com/srv/timeline-profile/screen-name/JaneTX"
+
+    body, stale, _, error = client.get(url)
+    assert (body, stale, error) == (b"payload", False, "")
+
+    body, stale, _, error = client.get(url)  # the 429 opens the gate
+    assert body == b"payload" and stale
+    assert "rate-limited" in error
+
+    body, stale, _, error = client.get(url)  # gated: served without a network call
+    assert body == b"payload" and stale
+    assert "quota" in error
+    assert len(calls) == 2
+    assert client.blocked_seconds() > 0
+
+
+def test_syndication_disk_cache_survives_a_fresh_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    url = "https://syndication.twitter.com/srv/timeline-profile/screen-name/JaneTX"
+    first = SyndicationClient(cache_dir=str(tmp_path))
+    monkeypatch.setattr(
+        first.session, "get", lambda *_a, **_k: _fake_response(200, b"payload")
+    )
+    assert first.get(url)[0] == b"payload"
+
+    fresh = SyndicationClient(cache_dir=str(tmp_path))  # e.g. after a restart
+    monkeypatch.setattr(
+        fresh.session,
+        "get",
+        lambda *_a, **_k: _fake_response(429, b"", {"x-rate-limit-reset": ""}),
+    )
+    body, stale, _, error = fresh.get(url)
+    assert body == b"payload" and stale
+    assert "last successful response" in error
+
+
 def test_public_feed_reports_unavailable_without_accounts() -> None:
     result = fetch_public_legislator_posts([])
     assert result.freshness == "unavailable"
@@ -187,6 +269,67 @@ def test_public_feed_merges_and_sorts_accounts(monkeypatch: pytest.MonkeyPatch) 
     assert len(result.items) == 6
     timestamps = [p.created_at for p in result.items]
     assert timestamps == sorted(timestamps, reverse=True)
+
+
+def test_indexed_x_feed_provides_recent_no_token_posts() -> None:
+    account = LegislatorSocialAccount(
+        "Dustin Burrows", "House", "Burrows4TX", "https://x.com/Burrows4TX"
+    )
+    body = b"""<?xml version="1.0"?><rss><channel><item>
+    <title>Texas House update from the Speaker - x.com</title>
+    <link>https://news.google.com/rss/articles/example</link>
+    <pubDate>Tue, 21 Jul 2026 19:51:26 GMT</pubDate>
+    </item></channel></rss>"""
+    posts = parse_indexed_x_posts(body, account)
+    assert len(posts) == 1
+    assert posts[0].handle == "Burrows4TX"
+    assert posts[0].text == "Texas House update from the Speaker"
+    assert posts[0].created_at == datetime(2026, 7, 21, 14, 51, 26, tzinfo=CENTRAL)
+
+
+def test_news_relevance_requires_texas_and_political_context() -> None:
+    assert is_texas_political_story("Texas Senate committee schedules a property tax hearing")
+    assert not is_texas_political_story("Senate Republicans debate a federal spending bill")
+    assert not is_texas_political_story("Texas A&M Forest Service adds wildfire aircraft")
+    assert headline_relevance(
+        "Texas House committee schedules a property tax hearing",
+        publisher="The Texas Tribune",
+    ) > headline_relevance("National politics roundup")
+
+
+def test_news_priority_balances_recency_and_relevance() -> None:
+    now = datetime(2026, 7, 24, 12, tzinfo=CENTRAL)
+    fresh = Headline(
+        "Texas agency issues an order",
+        "Local",
+        "https://example.com/fresh",
+        now,
+        relevance=10,
+    )
+    old = Headline(
+        "Texas Legislature committee hearing",
+        "Local",
+        "https://example.com/old",
+        datetime(2026, 7, 20, 12, tzinfo=CENTRAL),
+        relevance=17,
+    )
+    assert headline_priority(fresh, now) > headline_priority(old, now)
+
+
+def test_reachable_empty_feed_is_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "data_sources.CLIENT.get",
+        lambda *_args, **_kwargs: (
+            b"<?xml version='1.0'?><rss><channel></channel></rss>",
+            False,
+            5,
+            "",
+        ),
+    )
+    result = fetch_headline_feed("Empty but reachable", "https://example.com/feed")
+    assert result.freshness == "live"
+    assert result.items == []
+    assert "no current records" in result.error
 
 
 def test_texan_homepage_parser_uses_article_timestamp() -> None:
@@ -220,6 +363,30 @@ def test_headlines_are_deduplicated_and_ranked() -> None:
     deduped = dedupe_headlines([result])
     assert len(deduped) == 2
     assert deduped[0].relevance == 4
+
+
+def test_syndicated_rewordings_are_deduplicated() -> None:
+    now = datetime(2026, 7, 24, 12, tzinfo=CENTRAL)
+    first = Headline(
+        "Ken Paxton has long crusaded against voter fraud. His Senate rival now accuses him of committing it.",
+        "The Texas Tribune",
+        "https://example.com/tribune",
+        now,
+        relevance=13,
+    )
+    syndicated = Headline(
+        "Ken Paxton Touts His Efforts to Fight Voter Fraud. His Senate Opponent Is Now Accusing Him of Committing It.",
+        "ProPublica",
+        "https://example.com/propublica",
+        now,
+        relevance=9,
+    )
+    from models import SourceResult
+
+    result = SourceResult("news", "https://example.com", [syndicated, first])
+    deduped = dedupe_headlines([result])
+    assert len(deduped) == 1
+    assert deduped[0].publisher == "The Texas Tribune"
 
 
 def test_events_dedupe_and_ics_escape() -> None:
@@ -262,6 +429,32 @@ END:VCALENDAR"""
     assert items[0].venue == "Community Center, Room A"
 
 
+def test_simple_calendar_html_events_are_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = b"""<html><body><li class="simcal-event">
+    <span class="simcal-event-title">County Candidate Forum</span>
+    <span itemprop="startDate" content="2026-08-18T18:30:00-05:00">August 18</span>
+    <span itemprop="endDate" content="2026-08-18T20:00:00-05:00">8 pm</span>
+    <span class="simcal-event-address">Community Hall, San Antonio</span>
+    <a href="https://example.com/forum">Details</a>
+    </li></body></html>"""
+    monkeypatch.setattr(
+        "data_sources.CLIENT.get",
+        lambda *_args, **_kwargs: (body, False, 7, ""),
+    )
+    source = {
+        "name": "County GOP",
+        "region": "San Antonio",
+        "url": "https://example.com/calendar",
+        "page": "https://example.com/calendar",
+    }
+    result = fetch_html_events(source)
+    assert result.freshness == "live"
+    assert result.items[0].title == "County Candidate Forum"
+    assert result.items[0].starts_at == datetime(2026, 8, 18, 18, 30, tzinfo=CENTRAL)
+    assert result.items[0].ends_at == datetime(2026, 8, 18, 20, 0, tzinfo=CENTRAL)
+    assert result.items[0].venue == "Community Hall, San Antonio"
+
+
 @pytest.mark.parametrize(
     ("target", "today", "label"),
     [
@@ -272,3 +465,62 @@ END:VCALENDAR"""
 )
 def test_milestone_status(target: date, today: date, label: str) -> None:
     assert milestone_status(target, today)[0] == label
+
+
+def test_next_milestones_skips_past_and_sorts() -> None:
+    milestones = [
+        Milestone("Later", date(2027, 1, 12), "Legislature", "https://example.com"),
+        Milestone("Past", date(2026, 7, 15), "Campaign finance", "https://example.com"),
+        Milestone("Sooner", date(2026, 11, 3), "Election", "https://example.com"),
+    ]
+    upcoming = next_milestones(milestones, date(2026, 7, 24), count=2)
+    assert [m.name for m in upcoming] == ["Sooner", "Later"]
+
+
+def test_extract_topics_labels_in_fixed_order_without_duplicates() -> None:
+    topics = extract_topics(
+        "Texas Legislature weighs property tax cut as txlege campaign season begins"
+    )
+    assert topics == ["Legislature", "Elections", "Property tax"]
+    assert extract_topics("City council approves zoning update") == []
+
+
+def test_briefing_compiles_all_sections() -> None:
+    today = date(2026, 7, 24)
+    hearing = Hearing(
+        title="State Affairs - 7/28/2026",
+        chamber="House",
+        committee="State Affairs",
+        location="E1.026",
+        url="https://capitol.texas.gov/notice",
+        starts_at=datetime(2026, 7, 28, 10, 30, tzinfo=CENTRAL),
+    )
+    headline = Headline(
+        "Texas Legislature acts",
+        "The Texas Tribune",
+        "https://example.com/story",
+        datetime(2026, 7, 23, 9, tzinfo=CENTRAL),
+    )
+    event = PoliticalEvent(
+        "County Club Meeting",
+        "Austin",
+        "Travis County GOP",
+        "Club meeting",
+        "https://example.com/event",
+        datetime(2026, 7, 30, 18, 30, tzinfo=CENTRAL),
+        venue="Community Hall",
+    )
+    milestone = Milestone("Texas general election", date(2026, 11, 3), "Election", "https://example.com")
+    brief = make_briefing(today, [hearing], [headline], [event], [milestone])
+    assert "# Texas political intelligence brief — July 24, 2026" in brief
+    assert "Texas general election — Nov 03, 2026 (in 102 days)" in brief
+    assert "House State Affairs · E1.026 ([notice](https://capitol.texas.gov/notice))" in brief
+    assert "[Texas Legislature acts](https://example.com/story) — The Texas Tribune, Jul 23" in brief
+    assert "County Club Meeting — Travis County GOP · Community Hall (Austin)" in brief
+
+
+def test_briefing_states_when_sections_are_empty() -> None:
+    brief = make_briefing(date(2026, 7, 24), [], [], [])
+    assert "No House or Senate committee meetings are posted" in brief
+    assert "No fresh attributed reporting was returned." in brief
+    assert "No dated Republican field events fall inside the next two weeks." in brief

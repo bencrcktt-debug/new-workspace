@@ -4,15 +4,17 @@ A responsive Texas legislative and Republican political-intelligence dashboard f
 
 ## What it monitors
 
-- Texas Legislature Online bill activity and House/Senate hearing notices
-- Election, campaign-finance, bill-prefiling, and session deadlines
-- Current Texas Ethics Commission PAC contributions and expenditures
-- Fresh Texas political headlines from the Texas Tribune and three seven-day multi-publisher feeds
+- Texas Legislature Online bill activity and House/Senate hearing notices, grouped by hearing day
+- Election, campaign-finance, bill-prefiling, session, and sine-die deadlines through the 90th Legislature
+- Current Texas Ethics Commission PAC contributions and expenditures, with a top-10 comparison chart and CSV export
+- Fresh Texas political headlines from direct publishers and tightly filtered seven-day multi-publisher feeds, with issue tags, priority scoring, recency windows, and near-duplicate removal
 - The Legislative Reference Library's current directory of legislators on X
-- A live X feed of recent legislator posts on the command center, pulled from X's public syndication endpoint with no token required
+- A command-center Legislator Pulse board of recent legislator posts, pulled from X's public syndication endpoint with no token required (falls back to the official roster when rate-limited)
 - Optional token-based, account-filtered X posts (X API v2) for a bounded selection of legislators
-- Republican Party and club events across Austin, Dallas–Fort Worth, Houston, San Antonio, and statewide sources
+- Republican Party and club events across Austin, Dallas–Fort Worth, Houston, San Antonio, and statewide sources, presented as a filterable day-by-day agenda
 - Runtime freshness, latency, record counts, and fallback status for every checked source
+
+The command center also assembles a one-click **daily brief** — a Markdown download that compiles upcoming deadlines, this week's hearings with notice links, the top ten headlines, and the next two weeks of Republican field events. Countdown cards select the next three flagship political dates automatically, so the board never shows an expired countdown.
 
 The application identifies official records separately from attributed media, social, and event intelligence.
 
@@ -27,9 +29,15 @@ Open `http://localhost:8501`.
 
 ## Configure X
 
-The command center's live legislator feed and the complete legislator directory both work without credentials — the feed reads X's public syndication timelines, the same JSON X's own embed widgets use. That endpoint is rate-limited for anonymous callers (about 30 requests per window per IP), so results are cached and the app falls back to the embedded list timeline and a direct link when the limit is hit.
+No X credentials are required. The command center's Legislator Pulse board and the "Legislators on X" feed both read X's public syndication timelines — the same JSON X's own embed widgets use. That endpoint allows about 30 anonymous requests per window per IP, and the app is engineered to live inside that budget:
 
-Only the account-filtered cards on the "Legislators on X" tab require X API v2 read access. A token can be entered for the current browser session or stored in Streamlit secrets.
+- Each refresh reads at most six accounts and results are cached for 30 minutes.
+- A 429 response closes a gate until X's advertised reset time, so the app never deepens its own rate limit by retrying.
+- Every successful timeline is stored on disk, so the last-good posts continue to display through rate-limit windows, cache clears, and app restarts.
+- Recently indexed public status pages are merged with X's syndication timelines, which keeps the no-token feed current when X returns only pinned or older posts.
+- While no posts have ever been fetched and the gate is closed, the board shows the official LRL legislator roster with an honest note about when the feed resumes.
+
+An X API v2 bearer token is optional and never required: if one is present in secrets or entered in the "Legislators on X" tab, the app switches to the API list timeline (one request covers every legislator) and uses the public feed as its fallback.
 
 Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`:
 
@@ -57,11 +65,11 @@ Remote results are cached by source: X for 5 minutes, legislative/news feeds for
 | Area | Primary source | Behavior |
 |---|---|---|
 | Legislation and hearings | Texas Legislature Online RSS | Official records; links return to TLO |
-| Campaign finance | Texas Ethics Commission 2026 PAC workbook | In-app totals; signed reports and cash-on-hand searches remain authoritative |
+| Campaign finance | Texas Ethics Commission 2026 PAC workbook | In-app totals and top-10 chart; signed reports and cash-on-hand searches remain authoritative |
 | Legislator accounts | Legislative Reference Library | Parsed daily; no party affiliation inferred |
-| Headlines | Texas Tribune politics feed and three seven-day Google News RSS queries | Deduplicated, attributed, newest-first, and relevance-ranked |
-| Republican events | RPT and major-county public calendars | Best-effort because publishers use different calendar systems |
-| X posts (command center) | X public syndication profile timelines | No token; merged from a bounded set of legislator handles; rate-limited, cached, with embed/link fallback |
+| Headlines | Direct Texas publishers and three tightly scoped seven-day Google News RSS queries | Texas-policy filtered, attributed, near-deduplicated, and priority-ranked |
+| Republican events | RPT and major-county public calendars, including Williamson and Bexar County | WordPress, HTML, Simple Calendar, and ICS adapters feed a day-grouped agenda |
+| X posts (command center) | X public syndication timelines plus indexed public status pages | No token; recent posts are merged from two public paths, bounded, cached, and rate-limit aware |
 | X posts (Legislators on X tab) | X API v2 list-posts and user-posts endpoints | Requires post-read access; account-filtered requests are limited to 10 accounts |
 
 If a source fails after a successful request, the in-process last-good response is shown as stale. If no successful response exists, the relevant page remains usable with an unavailable state and authoritative links.
@@ -93,6 +101,6 @@ Parser tests use local fixtures. The Streamlit smoke test exercises every applic
 ## Project layout
 
 - `app.py` — Streamlit presentation and interaction layer
-- `models.py` — normalized records and source-result contracts
-- `data_sources.py` — resilient connectors, parsers, ranking, deduplication, and ICS generation
+- `models.py` — normalized records, milestone helpers, and source-result contracts
+- `data_sources.py` — resilient connectors, parsers, ranking, deduplication, issue tagging, ICS generation, and the daily-brief builder
 - `tests/` — parser fixtures, source-contract tests, and UI smoke tests

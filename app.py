@@ -16,6 +16,7 @@ from data_sources import (
     TEC_FINANCE_HOME,
     dedupe_events,
     dedupe_headlines,
+    extract_topics,
     fetch_events,
     fetch_finance,
     fetch_headlines,
@@ -25,9 +26,12 @@ from data_sources import (
     fetch_social_directory,
     fetch_social_posts,
     fetch_x_list_posts,
+    headline_priority,
+    make_briefing,
     make_ics,
 )
 from models import (
+    FinanceSummary,
     Headline,
     Hearing,
     LegislatorSocialAccount,
@@ -35,6 +39,7 @@ from models import (
     PoliticalEvent,
     SourceResult,
     milestone_status,
+    next_milestones,
 )
 
 
@@ -52,6 +57,17 @@ MILESTONES = (
     Milestone("Texas general election", date(2026, 11, 3), "Election", SOS_DATES),
     Milestone("Bill prefiling opens", date(2026, 11, 9), "Legislature", TLC_DATES),
     Milestone("90th Legislature convenes", date(2027, 1, 12), "Legislature", TLC_DATES),
+    Milestone("TEC semiannual report", date(2027, 1, 15), "Campaign finance", TEC_FINANCE_HOME),
+    Milestone("Bill filing deadline (60th day)", date(2027, 3, 12), "Legislature", TLC_DATES),
+    Milestone("Sine die — session ends", date(2027, 5, 31), "Legislature", TLC_DATES),
+)
+
+COUNTDOWN_TARGETS = (
+    ("General Election", date(2026, 11, 3)),
+    ("First Day of Bill Filing", date(2026, 11, 9)),
+    ("90th Session Convenes", date(2027, 1, 12)),
+    ("Bill Filing Deadline", date(2027, 3, 12)),
+    ("Sine Die — Session Ends", date(2027, 5, 31)),
 )
 
 st.set_page_config(
@@ -164,6 +180,13 @@ def inject_css() -> None:
         .hearing-item-meta{font-family:'IBM Plex Mono';font-size:8px;color:#778492;text-transform:uppercase;margin-top:4px}
         .hearing-foot{border-top:1px solid #d9dee3;padding:9px 14px;font-family:'IBM Plex Mono';font-size:8px;text-transform:uppercase;letter-spacing:.1em;color:#4e5b69}
         .publisher-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+        .priority-stack{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #8e2932;margin-bottom:11px}
+        .priority-row{display:grid;grid-template-columns:30px 1fr auto;gap:10px;align-items:start;padding:9px 11px;border-bottom:1px solid #dde2e7}
+        .priority-row:last-child{border-bottom:0}.priority-index{font-family:'IBM Plex Mono';font-size:9px;color:#8e2932;padding-top:2px}
+        .priority-title{font-family:'Libre Caslon Text',Georgia,serif;font-size:13px;font-weight:700;line-height:1.3;color:#243243}
+        .priority-title a{color:inherit;text-decoration:none}.priority-meta{font-family:'IBM Plex Mono';font-size:7px;color:#74808c;text-transform:uppercase;letter-spacing:.06em;margin-top:4px}
+        .priority-score{font-family:'IBM Plex Mono';font-size:7px;color:#6d7884;text-transform:uppercase;white-space:nowrap;background:#e8edf1;padding:4px 6px}
+        .subboard-label{font-family:'IBM Plex Mono';font-size:8px;letter-spacing:.11em;text-transform:uppercase;color:#697582;margin:8px 0 6px}
         .publisher-panel{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #273f54;min-height:168px;padding:9px 11px}
         .publisher-panel:nth-child(3n+1){border-top-color:#8e2932}.publisher-head{display:flex;gap:7px;align-items:center;border-bottom:1px solid #d8dde2;padding-bottom:7px;margin-bottom:2px}
         .publisher-monogram{width:25px;height:25px;background:#344b61;color:#fff;display:grid;place-items:center;font-family:'Libre Caslon Text';font-size:10px}
@@ -183,6 +206,36 @@ def inject_css() -> None:
         .event-kind{display:inline-block;margin-top:5px;padding:2px 5px;background:#e8edf1;color:#4c5a68;font-family:'IBM Plex Mono';font-size:7px;text-transform:uppercase;letter-spacing:.05em}
         .x-connect{font-family:'IBM Plex Mono';font-size:8px;text-transform:uppercase;letter-spacing:.08em;color:#157253;margin-bottom:8px}
         .x-roster-note{font-size:10px;line-height:1.45;color:#667483;padding:3px 0 7px}
+        .lower-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:17px;align-items:start;margin-top:14px}
+        .lower-grid .field-calendar-grid{grid-template-columns:1fr}
+        .deadline-board{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #1c3044;padding:5px 14px 8px;margin-bottom:8px}
+        .deadline-head{font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:#76242c;font-weight:600;padding:8px 0 3px;border-bottom:1px solid #d9dee3}
+        .deadline-board .deadline{border-bottom:1px solid #e0e4e8}
+        .deadline-board .deadline:last-child{border-bottom:0}
+        .agenda{display:grid;gap:12px;margin-top:8px}.agenda-day{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #1c3044}
+        .agenda-date{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:#edf1f4;border-bottom:1px solid #d3d9df}
+        .agenda-date strong{font-family:'Libre Caslon Text',Georgia,serif;font-size:16px;color:#223244}
+        .agenda-date span{font-family:'IBM Plex Mono';font-size:8px;text-transform:uppercase;color:#6d7884}
+        .agenda-items{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+        .agenda-item{padding:11px 13px;border-bottom:1px solid #e0e4e8;min-width:0}.agenda-item:nth-child(odd){border-right:1px solid #e0e4e8}
+        .agenda-item:only-child{grid-column:1/-1;border-right:0}
+        .agenda-time{font-family:'IBM Plex Mono';font-size:8px;color:#8e2932;text-transform:uppercase;letter-spacing:.06em}
+        .agenda-title{font-family:'Libre Caslon Text',Georgia,serif;font-size:13px;font-weight:700;color:#263647;line-height:1.3;margin:4px 0}
+        .agenda-title a{color:inherit;text-decoration:none}.agenda-meta{font-size:9px;color:#74808c;line-height:1.45}
+        .day-header{font-family:'IBM Plex Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#76242c;font-weight:600;margin:15px 0 8px;border-bottom:1px solid #cbd2d9;padding-bottom:4px}
+        .chart-panel{background:#f9fafb;border:1px solid #cbd2d9;border-top:3px solid #1c3044;padding:12px 15px;margin:6px 0 14px}
+        .chart-title{font-family:'Libre Caslon Text',Georgia,serif;font-size:16px;font-weight:700;color:#1b2939}
+        .chart-legend{display:flex;gap:16px;align-items:center;font-family:'IBM Plex Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:#52514e;margin:6px 0 10px}
+        .chart-legend span{display:inline-flex;align-items:center}
+        .chart-swatch{width:10px;height:10px;display:inline-block;margin-right:6px;border-radius:2px}
+        .chart-swatch.in,.chart-bar.in{background:#1c5cab}
+        .chart-swatch.out,.chart-bar.out{background:#b52b35}
+        .chart-row{display:grid;grid-template-columns:minmax(140px,230px) 1fr;gap:12px;align-items:center;padding:6px 2px;border-bottom:1px solid #e0e4e8}
+        .chart-row:last-child{border-bottom:0}.chart-row:hover{background:#f0f3f5}
+        .chart-name{font-size:11px;font-weight:600;color:#283646;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .chart-bar-line{display:flex;align-items:center;gap:7px;margin:2px 0}
+        .chart-bar{height:11px;border-radius:0 3px 3px 0;min-width:2px;display:inline-block;flex:none}
+        .chart-value{font-family:'IBM Plex Mono',monospace;font-size:9px;color:#52514e;white-space:nowrap}
         @media(max-width:700px){
           .block-container{padding:.7rem .75rem 8rem}.topbar{align-items:flex-start}.asof{display:none}
           .star{width:35px;height:35px}.brand-title{font-size:16px}.hero{padding:21px 18px;border-radius:17px}
@@ -197,9 +250,13 @@ def inject_css() -> None:
           .countdown:last-child{border-bottom:0}.countdown-number{font-size:31px}.countdown-name{font-size:16px}
           .ops-strip{grid-template-columns:repeat(2,1fr)}.ops-cell:nth-child(2){border-right:0}.ops-cell{border-bottom:1px solid #405063}
           .intelligence-grid{grid-template-columns:1fr}.publisher-grid{grid-template-columns:1fr}
+          .priority-row{grid-template-columns:25px 1fr}.priority-score{display:none}
           .hearing-board{min-height:210px}.publisher-panel{min-height:0}.board-title{font-size:25px}
           .lower-board{height:auto;max-height:410px}.field-row{grid-template-columns:52px 1fr}.field-region{display:none}
           .field-calendar-grid{grid-template-columns:1fr}
+          .lower-grid{grid-template-columns:1fr}
+          .agenda-items{grid-template-columns:1fr}.agenda-item:nth-child(odd){border-right:0}
+          .chart-row{grid-template-columns:1fr;gap:3px}.chart-name{white-space:normal}
           div[data-testid="stPills"],div[data-testid="stButtonGroup"]{left:8px;right:8px;bottom:8px;transform:none;width:auto;padding:6px}
           div[data-testid="stPills"] button,div[data-testid="stButtonGroup"] button{font-size:9px;min-height:38px}
         }
@@ -263,7 +320,9 @@ def live_x_list_posts(token: str, base_url: str) -> SourceResult:
     return fetch_x_list_posts(token, base_url)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+# 30 minutes: six syndication requests per refresh against X's 30-per-window
+# anonymous quota leaves headroom for other sessions on the same address.
+@st.cache_data(ttl=1800, show_spinner=False)
 def live_public_posts(accounts: tuple[LegislatorSocialAccount, ...]) -> SourceResult:
     return fetch_public_legislator_posts(list(accounts))
 
@@ -278,6 +337,10 @@ def public_feed_accounts(
     """
     defaults = get_secret("SOCIAL_DEFAULT_HANDLES", get_secret("TXLEGE_X_HANDLES", []))
     default_handles = [str(x).lstrip("@") for x in defaults] if isinstance(defaults, list) else []
+    if not default_handles:
+        # Without configured favorites, lead with active leadership accounts rather
+        # than the directory's alphabetical head, which is dominated by quiet accounts.
+        default_handles = list(DEFAULT_X_HANDLES)
     if directory_items:
         by_handle = {a.handle.lower(): a for a in directory_items}
         ordered = [by_handle[h.lower()] for h in default_handles if h.lower() in by_handle]
@@ -348,11 +411,19 @@ def section(title: str, note: str) -> None:
 
 
 def headline_card(item: Headline) -> None:
+    topics = "".join(
+        f'<span class="tag">{escape(topic)}</span>'
+        for topic in extract_topics(f"{item.title} {item.summary}")
+    )
+    # Aggregator feeds often restate the title as the description — skip those.
+    redundant = item.summary.lower().startswith(item.title[:60].lower())
+    summary = escape(item.summary[:220]) if item.summary and not redundant else ""
+    summary_html = f'<div class="record-summary">{summary}</div>' if summary else ""
     st.markdown(
         f"""<div class="record"><div class="record-top">
-        <span class="tag tag-red">{escape(item.publisher)}</span>
-        <span class="tag">priority {item.relevance}</span></div>
+        <span class="tag tag-red">{escape(item.publisher)}</span>{topics}</div>
         <div class="record-title"><a href="{safe_url(item.url)}" target="_blank">{escape(item.title)} ↗</a></div>
+        {summary_html}
         <div class="meta"><span>{escape(fmt_time(item.published_at))}</span></div></div>""",
         unsafe_allow_html=True,
     )
@@ -402,16 +473,15 @@ def compact_age(value: datetime | None) -> str:
 
 
 def countdown_strip() -> None:
-    targets = [
-        ("General Election", date(2026, 11, 3), "November 3, 2026"),
-        ("First Day of Bill Filing", date(2026, 11, 9), "November 9, 2026"),
-        ("90th Legislative Session", date(2027, 1, 12), "January 12, 2027"),
-    ]
+    """The next three flagship political dates, selected automatically."""
+    targets = [(name, target) for name, target in COUNTDOWN_TARGETS if target >= TODAY][:3]
+    if not targets:
+        targets = list(COUNTDOWN_TARGETS[-3:])
     cards = []
     now = datetime.now(CENTRAL)
-    for index, (name, target, date_label) in enumerate(targets, 1):
+    for index, (name, target) in enumerate(targets, 1):
         target_time = datetime.combine(target, datetime.min.time(), tzinfo=CENTRAL)
-        if name == "90th Legislative Session":
+        if "Convenes" in name:
             target_time = target_time.replace(hour=12)
         remaining = max(0, int((target_time - now).total_seconds()))
         days, hours = remaining // 86400, (remaining % 86400) // 3600
@@ -419,7 +489,7 @@ def countdown_strip() -> None:
         unit = "complete" if target < TODAY else f"days<br>{hours} hrs"
         cards.append(
             f"""<div class="countdown"><span class="countdown-index">0{index}</span>
-            <div><div class="countdown-date">{escape(date_label)}</div>
+            <div><div class="countdown-date">{escape(target.strftime('%B %d, %Y'))}</div>
             <div class="countdown-name">{escape(name)}</div></div>
             <div><span class="countdown-number">{escape(str(state))}</span>
             <span class="countdown-unit">{unit}</span></div></div>"""
@@ -545,6 +615,38 @@ def publisher_panels(headlines: list[Headline]) -> str:
     return f'<div class="publisher-grid">{"".join(panels)}</div>'
 
 
+def priority_news_panel(headlines: list[Headline], limit: int = 5) -> str:
+    """A diverse, action-ranked lead list for the command center."""
+    selected: list[Headline] = []
+    seen_publishers: set[str] = set()
+    for item in headlines:
+        if item.publisher in seen_publishers:
+            continue
+        selected.append(item)
+        seen_publishers.add(item.publisher)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        for item in headlines:
+            if item in selected:
+                continue
+            selected.append(item)
+            if len(selected) >= limit:
+                break
+    if not selected:
+        return '<div class="empty">No priority reporting is available.</div>'
+    rows = []
+    for index, item in enumerate(selected, 1):
+        topics = ", ".join(extract_topics(f"{item.title} {item.summary}")) or "Texas politics"
+        rows.append(
+            f"""<div class="priority-row"><span class="priority-index">0{index}</span><div>
+            <div class="priority-title"><a href="{safe_url(item.url)}" target="_blank">{escape(item.title)} ↗</a></div>
+            <div class="priority-meta">{escape(item.publisher)} · {escape(compact_age(item.published_at))} ago · {escape(topics)}</div></div>
+            <span class="priority-score">Signal {headline_priority(item):.0f}</span></div>"""
+        )
+    return f'<div class="priority-stack">{"".join(rows)}</div>'
+
+
 def field_calendar_panel(events: list[PoliticalEvent]) -> str:
     if not events:
         return '<div class="empty">No upcoming Republican events were returned.</div>'
@@ -563,6 +665,34 @@ def field_calendar_panel(events: list[PoliticalEvent]) -> str:
             <div class="field-region">{escape(item.region)}</div></div>"""
         )
     return f'<div class="field-calendar-grid">{"".join(rows)}</div>'
+
+
+def calendar_agenda(events: list[PoliticalEvent]) -> str:
+    """Readable, date-grouped calendar used after filters are applied."""
+    if not events:
+        return '<div class="empty">No upcoming events match these filters.</div>'
+    days: dict[date, list[PoliticalEvent]] = {}
+    for item in events:
+        if item.starts_at:
+            days.setdefault(item.starts_at.astimezone(CENTRAL).date(), []).append(item)
+    groups = []
+    for day, items in sorted(days.items()):
+        entries = []
+        for item in items:
+            start = item.starts_at.astimezone(CENTRAL)
+            location = " · ".join(x for x in [item.venue, item.address] if x)
+            entries.append(
+                f"""<div class="agenda-item"><div class="agenda-time">{escape(start.strftime('%I:%M %p').lstrip('0'))} CT · {escape(item.event_type)}</div>
+                <div class="agenda-title"><a href="{safe_url(item.url)}" target="_blank">{escape(item.title)} ↗</a></div>
+                <div class="agenda-meta">{escape(item.organizer)} · {escape(item.region)}
+                {(' · ' + escape(location)) if location else ''}</div></div>"""
+            )
+        groups.append(
+            f"""<section class="agenda-day"><div class="agenda-date"><strong>{escape(day.strftime('%A, %B %d').replace(' 0', ' '))}</strong>
+            <span>{len(items)} event{'' if len(items) == 1 else 's'}</span></div>
+            <div class="agenda-items">{''.join(entries)}</div></section>"""
+        )
+    return f'<div class="agenda">{"".join(groups)}</div>'
 
 
 def social_posts_panel(posts: list[Any]) -> str:
@@ -595,6 +725,35 @@ def social_directory_panel(accounts: list[LegislatorSocialAccount]) -> str:
     return "".join(rows)
 
 
+def deadline_board(milestones: list[Milestone]) -> str:
+    if not milestones:
+        return ""
+    rows = []
+    for item in milestones:
+        days, _ = milestone_status(item.occurs_on, TODAY)
+        rows.append(
+            f"""<div class="deadline"><div><div class="deadline-name">{escape(item.name)}</div>
+            <div class="deadline-date">{item.occurs_on.strftime('%b %d, %Y')} · {escape(item.category)}</div></div>
+            <div class="deadline-days">{escape(days)}</div></div>"""
+        )
+    return f'<div class="deadline-board"><div class="deadline-head">Key deadlines</div>{"".join(rows)}</div>'
+
+
+def pulse_board(posts: SourceResult, accounts: list[LegislatorSocialAccount]) -> str:
+    if posts.items:
+        body = social_posts_panel(posts.items)
+    elif accounts:
+        reason = posts.error or "Live public timelines are temporarily unavailable."
+        body = (
+            f'<div class="x-roster-note">{escape(reason)} '
+            "Showing the official legislator roster meanwhile.</div>"
+            + social_directory_panel(accounts)
+        )
+    else:
+        body = '<div class="empty">The legislator directory is temporarily unavailable.</div>'
+    return f'<div class="lower-board">{body}</div>'
+
+
 def load_command_data() -> tuple[list[SourceResult], list[SourceResult], list[SourceResult], list[SourceResult], SourceResult]:
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_activity = executor.submit(live_activity)
@@ -612,46 +771,79 @@ def load_command_data() -> tuple[list[SourceResult], list[SourceResult], list[So
 
 
 def command_center() -> None:
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    token = configured_x_token()
+    base_url = str(get_secret("X_API_BASE_URL", "https://api.x.com") or "https://api.x.com")
+    with ThreadPoolExecutor(max_workers=5) as executor:
         hearing_future = executor.submit(live_hearings)
         headline_future = executor.submit(live_headlines)
         event_future = executor.submit(live_events)
+        directory_future = executor.submit(live_directory)
+        directory = directory_future.result()
+        accounts = public_feed_accounts(directory.items)
+        # With API access, one list request covers every legislator; the anonymous
+        # syndication feed is the fallback and the only path without a token.
+        if token:
+            posts_future = executor.submit(live_x_list_posts, token, base_url)
+        else:
+            posts_future = executor.submit(live_public_posts, tuple(accounts))
         hearing_results = hearing_future.result()
         headline_results = headline_future.result()
         event_results = event_future.result()
+        posts = posts_future.result()
+    if token and not posts.items:
+        posts = live_public_posts(tuple(accounts))
     remember(hearing_results)
     remember(headline_results)
     remember(event_results)
+    remember(directory)
+    remember(posts)
     hearings = flatten(hearing_results)
     headlines = dedupe_headlines(headline_results)
     events = dedupe_events(event_results)
+    all_results = [*hearing_results, *headline_results, *event_results, directory, posts]
+    responding = sum(1 for result in all_results if result.freshness != "unavailable")
     countdown_strip()
     operations_strip(hearings, headlines, events)
     st.markdown(
         f"""<div class="intelligence-grid"><section><div class="board-kicker">Texas Legislature</div>
         <div class="board-title">This Week’s Hearings</div><div class="board-rule"></div>
-        {hearing_board("House", hearings)}{hearing_board("Senate", hearings)}</section>
+        {hearing_board("House", hearings)}{hearing_board("Senate", hearings)}
+        {deadline_board(next_milestones(MILESTONES, TODAY, 4))}</section>
         <section><div class="board-kicker">Across Texas</div>
-        <div class="board-title">Top Headlines</div><div class="board-rule"></div>
-        {publisher_panels(headlines)}</section></div>
-        <div class="board-footer"><span class="connected">Live data connected</span>
+        <div class="board-title">Priority News Brief</div><div class="board-rule"></div>
+        {priority_news_panel(headlines)}
+        <div class="subboard-label">Reporting by source</div>{publisher_panels(headlines)}</section></div>
+        <div class="board-footer"><span class="connected">{responding}/{len(all_results)} sources responding</span>
         <span>Hearing data: Texas Legislature Online · News updates every 15 minutes</span>
         <span>Updated {datetime.now(CENTRAL).strftime('%I:%M %p').lstrip('0')} CT</span></div>""",
         unsafe_allow_html=True,
     )
     st.markdown(
-        f"""<div class="board-kicker">Republican Field Network</div>
+        f"""<div class="lower-grid"><section><div class="board-kicker">Republican Field Network</div>
         <div class="board-title">Upcoming GOP Events</div><div class="board-rule"></div>
-        <div class="lower-board">{field_calendar_panel(events)}</div>""",
+        <div class="lower-board">{field_calendar_panel(events)}</div></section>
+        <section><div class="board-kicker">Legislators on X</div>
+        <div class="board-title">Legislator Pulse</div><div class="board-rule"></div>
+        {pulse_board(posts, accounts)}</section></div>""",
         unsafe_allow_html=True,
     )
-    st.download_button(
-        "Download GOP calendar (.ics)",
-        make_ics(events, "Texas Republican field calendar"),
-        "texas-gop-calendar.ics",
-        "text/calendar",
-        width="stretch",
-    )
+    calendar_col, brief_col = st.columns(2)
+    with calendar_col:
+        st.download_button(
+            "Download GOP calendar (.ics)",
+            make_ics(events, "Texas Republican field calendar"),
+            "texas-gop-calendar.ics",
+            "text/calendar",
+            width="stretch",
+        )
+    with brief_col:
+        st.download_button(
+            "Download daily brief (.md)",
+            make_briefing(TODAY, hearings, headlines, events, MILESTONES),
+            f"texas-daily-brief-{TODAY.isoformat()}.md",
+            "text/markdown",
+            width="stretch",
+        )
 
 
 def legislature_page() -> None:
@@ -664,6 +856,15 @@ def legislature_page() -> None:
     tab_activity, tab_hearings, tab_dates = st.tabs(["Activity", "Hearings", "Deadlines"])
 
     with tab_activity:
+        if not activity:
+            prefiling_days = (date(2026, 11, 9) - TODAY).days
+            if prefiling_days > 0:
+                st.markdown(
+                    f'<div class="warning-box"><b>Interim period:</b> Texas Legislature Online '
+                    "publishes filing feeds only on days with new activity. Bill prefiling for the "
+                    f"90th Legislature opens November 9, 2026 — {prefiling_days} days away.</div>",
+                    unsafe_allow_html=True,
+                )
         c1, c2, c3 = st.columns([1.1, 1, 2])
         with c1:
             chamber = st.selectbox("Chamber", ["All", "House", "Senate", "Both"])
@@ -714,15 +915,67 @@ def legislature_page() -> None:
                 "texas-legislative-hearings.ics",
                 "text/calendar",
             )
-            for item in shown_hearings:
+            dated = sorted(
+                (x for x in shown_hearings if x.starts_at),
+                key=lambda x: x.starts_at,
+            )
+            current_day: date | None = None
+            for item in dated:
+                item_day = item.starts_at.astimezone(CENTRAL).date()
+                if item_day != current_day:
+                    current_day = item_day
+                    st.markdown(
+                        f'<div class="day-header">{item_day.strftime("%A, %B %d")}</div>',
+                        unsafe_allow_html=True,
+                    )
                 hearing_card(item)
+            undated = [x for x in shown_hearings if not x.starts_at]
+            if undated:
+                st.markdown('<div class="day-header">Date pending</div>', unsafe_allow_html=True)
+                for item in undated:
+                    hearing_card(item)
         else:
             empty_state("No hearing notices match these filters.")
 
     with tab_dates:
-        for milestone in MILESTONES:
+        for milestone in sorted(MILESTONES, key=lambda m: m.occurs_on):
             milestone_row(milestone)
         st.link_button("Texas Legislative Council dates ↗", TLC_DATES)
+
+
+def money_label(value: float) -> str:
+    if abs(value) >= 1_000_000:
+        return f"${value / 1_000_000:,.1f}M"
+    if abs(value) >= 1_000:
+        return f"${value / 1_000:,.0f}K"
+    return f"${value:,.0f}"
+
+
+def finance_chart(items: list[FinanceSummary]) -> str:
+    """Paired-bar comparison of the top filers by contributions.
+
+    Colors validated for CVD safety and contrast: #1c5cab (contributions) and
+    #b52b35 (expenditures); values are also direct-labeled in ink.
+    """
+    top = sorted(items, key=lambda x: x.contributions, reverse=True)[:10]
+    if not top:
+        return ""
+    scale = max(max(x.contributions for x in top), max(x.expenditures for x in top), 1.0)
+    rows = []
+    for item in top:
+        # 78% ceiling leaves room for the direct value label beside the longest bar.
+        in_width = max(0.6, item.contributions / scale * 78)
+        out_width = max(0.6, item.expenditures / scale * 78)
+        rows.append(
+            f"""<div class="chart-row"><div class="chart-name" title="{escape(item.filer_name)}">{escape(item.filer_name)}</div>
+            <div><div class="chart-bar-line"><span class="chart-bar in" style="width:{in_width:.1f}%"></span>
+            <span class="chart-value">{escape(money_label(item.contributions))}</span></div>
+            <div class="chart-bar-line"><span class="chart-bar out" style="width:{out_width:.1f}%"></span>
+            <span class="chart-value">{escape(money_label(item.expenditures))}</span></div></div></div>"""
+        )
+    return f"""<div class="chart-panel"><div class="chart-title">Top 10 PACs by contributions</div>
+    <div class="chart-legend"><span><span class="chart-swatch in"></span>Contributions</span>
+    <span><span class="chart-swatch out"></span>Expenditures</span></div>{"".join(rows)}</div>"""
 
 
 def finance_page() -> None:
@@ -762,6 +1015,8 @@ def finance_page() -> None:
         metric("Expenditures", f"${total_out / 1_000_000:,.1f}M", "reported political spending")
     with cols[2]:
         metric("Net activity", f"${(total_in-total_out) / 1_000_000:,.1f}M", "receipts minus expenditures")
+    if shown:
+        st.markdown(finance_chart(shown), unsafe_allow_html=True)
     frame = pd.DataFrame(
         [
             {
@@ -788,6 +1043,12 @@ def finance_page() -> None:
             "Net activity": st.column_config.NumberColumn(format="$%.0f"),
         },
     )
+    st.download_button(
+        "Download filtered results (.csv)",
+        frame.to_csv(index=False),
+        "tec-pac-summary.csv",
+        "text/csv",
+    )
     mobile_cards = "".join(
         f"""<div class="record"><div class="record-top"><span class="tag tag-red">#{item.rank}</span>
             <span class="tag">{escape(item.filer_type)}</span></div><div class="record-title">{escape(item.filer_name)}</div>
@@ -813,17 +1074,57 @@ def headlines_page() -> None:
     results = live_headlines()
     remember(results)
     items = dedupe_headlines(results)
+    now = datetime.now(CENTRAL)
+    fresh_24 = sum(
+        1 for x in items if x.published_at and x.published_at >= now - timedelta(hours=24)
+    )
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        metric("Headlines", str(len(items)), "deduplicated, 7-day window")
+    with summary_cols[1]:
+        metric("Past 24 hours", str(fresh_24), "new attributed reporting")
+    with summary_cols[2]:
+        metric("Publishers", str(len({x.publisher for x in items})), "named outlets")
+    with summary_cols[3]:
+        metric(
+            "Sources online",
+            f"{sum(1 for x in results if x.freshness != 'unavailable')}/{len(results)}",
+            "responding now",
+        )
     publishers = ["All"] + sorted({x.publisher for x in items})
-    c1, c2 = st.columns([1, 2])
+    c1, c2, c3, c4 = st.columns([1.4, 1, 1, 2])
     with c1:
         publisher = st.selectbox("Publisher", publishers)
     with c2:
+        window = st.selectbox("Window", ["Any time", "24 hours", "3 days", "7 days"])
+    with c3:
+        ordering = st.selectbox("Sort", ["Priority brief", "Newest first"])
+    with c4:
         query = st.text_input("Search headlines", placeholder="Issue, official, county, or race")
+    window_hours = {"24 hours": 24, "3 days": 72, "7 days": 168}.get(window)
+    cutoff = now - timedelta(hours=window_hours) if window_hours else None
     shown = [
         x for x in items
         if (publisher == "All" or x.publisher == publisher)
         and (not query or query.lower() in f"{x.title} {x.summary}".lower())
+        and (cutoff is None or (x.published_at and x.published_at >= cutoff))
     ]
+    if ordering == "Priority brief":
+        shown = sorted(
+            shown,
+            key=lambda x: (
+                headline_priority(x),
+                x.relevance,
+                x.published_at.timestamp() if x.published_at else 0,
+            ),
+            reverse=True,
+        )
+    else:
+        shown = sorted(
+            shown,
+            key=lambda x: x.published_at.timestamp() if x.published_at else 0,
+            reverse=True,
+        )
     if shown:
         for item in shown[:50]:
             headline_card(item)
@@ -833,8 +1134,11 @@ def headlines_page() -> None:
 
 def social_page() -> None:
     st.markdown("## Texas legislators on X")
-    st.caption("Account identities come from the Legislative Reference Library; post content belongs to each account.")
-    with st.expander("Connect or update X API access"):
+    st.caption(
+        "Works without a token by combining public X timelines with recently indexed public posts. "
+        "Account identities come from the Legislative Reference Library."
+    )
+    with st.expander("Optional: connect X API access"):
         entered_token = st.text_input(
             "X API bearer token",
             type="password",
@@ -849,7 +1153,7 @@ def social_page() -> None:
                     st.cache_data.clear()
                     st.rerun()
         with clear_col:
-            if st.button("Use embedded public feed", width="stretch"):
+            if st.button("Use no-token public feed", width="stretch"):
                 st.session_state.pop("runtime_x_bearer_token", None)
                 st.cache_data.clear()
                 st.rerun()
@@ -874,13 +1178,17 @@ def social_page() -> None:
         get_secret("TXLEGE_X_HANDLES", []),
     )
     default_handles = {str(x).lstrip("@").lower() for x in defaults} if isinstance(defaults, list) else set()
-    default_accounts = [x for x in directory.items if x.handle.lower() in default_handles][:10]
+    if not default_handles:
+        default_handles = {handle.lower() for handle in DEFAULT_X_HANDLES}
+    default_accounts = [x for x in filtered if x.handle.lower() in default_handles][:10]
+    if not default_accounts:
+        default_accounts = filtered[:PUBLIC_FEED_MAX_ACCOUNTS]
     options = {f"{x.name} · @{x.handle}": x for x in filtered}
     default_labels = [
         label for label, account in options.items() if account.handle.lower() in default_handles
     ]
     selected_labels = st.multiselect(
-        "Live-feed accounts (maximum 10)",
+        "Tracked accounts (maximum 10)",
         list(options),
         default=default_labels,
         max_selections=10,
@@ -890,10 +1198,17 @@ def social_page() -> None:
     base_url = str(get_secret("X_API_BASE_URL", "https://api.x.com") or "https://api.x.com")
     tab_feed, tab_directory = st.tabs(["Recent posts", f"Directory ({len(filtered)})"])
     with tab_feed:
-        posts = live_posts(token, base_url, tuple(selected))
+        if token:
+            posts = live_posts(token, base_url, tuple(selected))
+            if not posts.items:
+                posts = live_public_posts(tuple(selected[:PUBLIC_FEED_MAX_ACCOUNTS]))
+        else:
+            posts = live_public_posts(tuple(selected[:PUBLIC_FEED_MAX_ACCOUNTS]))
         remember(posts)
         if posts.items:
             status_line(posts)
+            if not token:
+                st.caption("Reading public timelines and indexed public status pages — no token required.")
             for post in posts.items:
                 st.markdown(
                     f"""<div class="record"><div class="record-top"><span class="tag tag-blue">
@@ -905,9 +1220,10 @@ def social_page() -> None:
                     unsafe_allow_html=True,
                 )
         else:
+            detail = escape(posts.error or "No recent posts were returned.")
             st.markdown(
-                '<div class="warning-box"><b>Live X API access is not connected.</b> Add a bearer token with '
-                "post-read access above. X’s public embedded list is rate-limited and is not used as a false live fallback.</div>",
+                f'<div class="warning-box"><b>The live feed is temporarily unavailable.</b> {detail} '
+                "Recent posts are kept and shown once a successful refresh has happened.</div>",
                 unsafe_allow_html=True,
             )
             st.link_button("Open the LRL legislator list on X ↗", LRL_X_LIST)
@@ -945,10 +1261,10 @@ def events_page() -> None:
     with summary_cols[3]:
         metric(
             "Sources online",
-            f"{sum(1 for x in results if x.ok)}/{len(results)}",
-            "live or cached",
+            f"{sum(1 for x in results if x.freshness != 'unavailable')}/{len(results)}",
+            "responding now",
         )
-    c1, c2, c3, c4 = st.columns([1, 1, 1.35, 1.65])
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1.35, 1, 1.65])
     with c1:
         region = st.selectbox("Region", ["All"] + sorted({x.region for x in events}))
     with c2:
@@ -956,13 +1272,26 @@ def events_page() -> None:
     with c3:
         organizer = st.selectbox("Organization", ["All"] + organizations)
     with c4:
+        window = st.selectbox(
+            "Window",
+            ["Next 30 days", "Next 14 days", "Next 60 days", "Next 120 days"],
+        )
+    with c5:
         query = st.text_input("Search events", placeholder="Club, organizer, venue, or keyword")
+    horizon = {
+        "Next 14 days": 14,
+        "Next 30 days": 30,
+        "Next 60 days": 60,
+        "Next 120 days": 120,
+    }[window]
     shown = [
         x for x in events
         if (region == "All" or x.region == region)
         and (event_type == "All" or x.event_type == event_type)
         and (organizer == "All" or x.organizer == organizer)
         and (not query or query.lower() in f"{x.title} {x.organizer} {x.venue}".lower())
+        and x.starts_at
+        and x.starts_at.astimezone(CENTRAL).date() <= TODAY + timedelta(days=horizon)
     ]
     if shown:
         st.download_button(
@@ -971,10 +1300,7 @@ def events_page() -> None:
             "texas-republican-field-calendar.ics",
             "text/calendar",
         )
-        event_columns = st.columns(2)
-        for index, item in enumerate(shown):
-            with event_columns[index % 2]:
-                event_card(item)
+        st.markdown(calendar_agenda(shown), unsafe_allow_html=True)
     else:
         empty_state("No upcoming events match these filters.")
     with st.expander("Connected sources and status"):
