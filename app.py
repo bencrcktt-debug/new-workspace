@@ -20,8 +20,10 @@ from data_sources import (
     extract_topics,
     fetch_events,
     fetch_finance,
+    fetch_government_intelligence,
     fetch_headlines,
     fetch_hearings,
+    fetch_influence_intelligence,
     fetch_legislative_activity,
     fetch_public_legislator_posts,
     fetch_social_directory,
@@ -30,9 +32,11 @@ from data_sources import (
     headline_priority,
     make_briefing,
     make_ics,
+    select_action_records,
 )
 from models import (
     FinanceSummary,
+    GovernmentRecord,
     Headline,
     Hearing,
     LegislatorSocialAccount,
@@ -129,7 +133,7 @@ def inject_css() -> None:
         .empty{background:#fff;border:1px dashed #bfc8d2;border-radius:13px;text-align:center;padding:28px;color:var(--muted);font-size:12px}
         .mobile-only{display:none}
         div[data-testid="stPills"],div[data-testid="stButtonGroup"]{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);
-          z-index:1000;width:min(1040px,calc(100vw - 28px));margin:0!important;padding:8px;
+          z-index:1000;width:min(1260px,calc(100vw - 28px));margin:0!important;padding:8px;
           background:rgba(16,28,42,.96);border:1px solid #526171;border-bottom:3px solid #8f2831;
           box-shadow:0 12px 38px rgba(8,20,32,.3);backdrop-filter:blur(12px);overflow-x:auto}
         div[data-testid="stPills"]>div,div[data-testid="stButtonGroup"]>div{min-width:max-content}
@@ -251,6 +255,22 @@ def inject_css() -> None:
         .coverage-state:before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:5px;background:#a3acb7}
         .coverage-state.live:before{background:#16805a}.coverage-state.cached:before{background:#3374aa}
         .coverage-state.stale:before{background:#d48712}.coverage-state.unavailable:before{background:#a3acb7}
+        .expanded-coverage{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));border:1px solid #c9d0d7;
+          background:#f8fafb;margin:5px 0 15px}.expanded-coverage .coverage-cell:last-child{border-right:0}
+        .action-queue{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border:1px solid #c9d0d7;
+          border-top:3px solid #8e2932;background:#f8fafb;margin:7px 0 12px}
+        .action-row{display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:9px;padding:11px 12px;
+          border-bottom:1px solid #dde2e7;min-width:0}
+        .action-row:nth-child(odd){border-right:1px solid #dde2e7}
+        .action-row:nth-last-child(-n+2){border-bottom:0}
+        .action-index{font-family:'IBM Plex Mono';font-size:9px;color:#8e2932;padding-top:3px}
+        .action-title{font-family:'Libre Caslon Text',Georgia,serif;font-size:13px;font-weight:700;
+          line-height:1.3;color:#243243}
+        .action-title a{color:inherit;text-decoration:none}.action-title a:hover{text-decoration:underline}
+        .action-meta{font-family:'IBM Plex Mono';font-size:7px;color:#74808c;text-transform:uppercase;
+          letter-spacing:.04em;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .action-timing{font-family:'IBM Plex Mono';font-size:8px;color:#76242c;background:#f0e7e8;
+          padding:5px 6px;white-space:nowrap;height:fit-content}
         a:focus-visible,button:focus-visible{outline:3px solid #d99b31!important;outline-offset:2px}
         .record-title a:hover,.priority-title a:hover,.headline-copy a:hover,.field-title a:hover,.agenda-title a:hover{text-decoration:underline}
         @media(max-width:700px){
@@ -277,6 +297,12 @@ def inject_css() -> None:
           .briefing-head{display:block}.briefing-title{font-size:28px}.briefing-copy{text-align:left;margin-top:7px}
           .coverage-grid{grid-template-columns:repeat(2,1fr)}.coverage-cell:nth-child(2){border-right:0}
           .coverage-cell:nth-child(-n+2){border-bottom:1px solid #d7dde2}
+          .expanded-coverage{grid-template-columns:repeat(2,1fr)}
+          .expanded-coverage .coverage-cell:nth-child(even){border-right:0}
+          .expanded-coverage .coverage-cell{border-bottom:1px solid #d7dde2}
+          .action-queue{grid-template-columns:1fr}.action-row:nth-child(odd){border-right:0}
+          .action-row:nth-last-child(-n+2){border-bottom:1px solid #dde2e7}.action-row:last-child{border-bottom:0}
+          .action-row{grid-template-columns:27px minmax(0,1fr)}.action-timing{grid-column:2;width:max-content}
           div[data-testid="stPills"],div[data-testid="stButtonGroup"]{left:8px;right:8px;bottom:8px;transform:none;width:auto;padding:6px}
           div[data-testid="stPills"] button,div[data-testid="stButtonGroup"] button{font-size:9px;min-height:38px}
         }
@@ -316,6 +342,16 @@ def live_headlines() -> list[SourceResult]:
 @st.cache_data(ttl=1800, show_spinner=False)
 def live_events() -> list[SourceResult]:
     return fetch_events()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def live_government_intelligence() -> list[SourceResult]:
+    return fetch_government_intelligence()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def live_influence_intelligence() -> list[SourceResult]:
+    return fetch_influence_intelligence()
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -452,6 +488,53 @@ def headline_card(item: Headline) -> None:
         <div class="record-title"><a href="{safe_url(item.url)}" target="_blank">{escape(item.title)} ↗</a></div>
         {summary_html}
         <div class="meta"><span>{escape(fmt_time(item.published_at))}</span></div></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def government_record_card(item: GovernmentRecord) -> None:
+    value = f"<span>{escape(item.value)}</span>" if item.value else ""
+    identifier = (
+        f'<span class="tag">{escape(item.identifier)}</span>' if item.identifier else ""
+    )
+    summary = (
+        f'<div class="record-summary">{escape(item.summary[:420])}</div>'
+        if item.summary
+        else ""
+    )
+    time_parts = []
+    if item.published_at:
+        published_label = (
+            "Registered"
+            if item.category == "Lobby registration"
+            else "Filed"
+            if item.status == "Filed"
+            else "Published"
+        )
+        time_parts.append(
+            f"<span>{published_label} {escape(fmt_time(item.published_at))}</span>"
+        )
+    if item.occurs_at:
+        occurs_label = (
+            "Meets"
+            if item.category == "Open meeting"
+            else "Through"
+            if item.category == "Lobby registration"
+            else "Occurs"
+        )
+        time_parts.append(
+            f"<span>{occurs_label} {escape(fmt_time(item.occurs_at))}</span>"
+        )
+    if not time_parts:
+        time_parts.append("<span>Current official record</span>")
+    st.markdown(
+        f"""<div class="record"><div class="record-top">
+        <span class="tag tag-red">{escape(item.category)}</span>
+        <span class="tag tag-blue">{escape(item.status or 'Current')}</span>{identifier}</div>
+        <div class="record-title"><a href="{safe_url(item.url)}" target="_blank">
+        {escape(item.title)} ↗</a></div>{summary}
+        <div class="meta"><span>{escape(item.agency)}</span>
+        {''.join(time_parts)}{value}</div></div>""",
         unsafe_allow_html=True,
     )
 
@@ -712,6 +795,126 @@ def source_coverage_panel(
     return f'<div class="coverage-grid">{"".join(cells)}</div>'
 
 
+def expanded_intelligence_panel(
+    government: list[SourceResult], influence: list[SourceResult]
+) -> str:
+    groups = [
+        ("Agency meetings", "Open meeting", government),
+        ("Rulemaking", "Rules", government),
+        ("Governor & courts", "Executive / judicial", government),
+        ("Election data", "Official portals", government),
+        ("Lobby & campaign", "Daily disclosures", influence),
+        ("State contracts", "Active listings", influence),
+    ]
+    all_government = flatten(government)
+    all_influence = flatten(influence)
+    cells = []
+    for label, note, results in groups:
+        records = all_government if results is government else all_influence
+        if label == "Agency meetings":
+            count = sum(item.category == "Open meeting" for item in records)
+        elif label == "Rulemaking":
+            count = sum("Rules" in item.category or item.category == "Regulatory docket" for item in records)
+        elif label == "Governor & courts":
+            count = sum(
+                item.agency in {"Office of the Governor", "Supreme Court of Texas"}
+                for item in records
+            )
+        elif label == "Election data":
+            count = sum("Election" in item.category for item in records)
+        elif label == "Lobby & campaign":
+            count = sum(
+                item.category in {"Lobby registration", "Direct campaign expenditure"}
+                or item.category == "Lobby activity report"
+                for item in records
+            )
+        else:
+            count = sum(item.category == "State contract" for item in records)
+        responding = sum(result.freshness != "unavailable" for result in results)
+        cells.append(
+            f"""<div class="coverage-cell"><div class="coverage-top">
+            <span class="coverage-name">{escape(label)}</span>
+            <span class="coverage-state {'live' if responding else 'unavailable'}">
+            {'live' if responding else 'unavailable'}</span></div>
+            <div class="coverage-value">{count} records</div>
+            <div class="coverage-note">{escape(note)}</div></div>"""
+        )
+    return (
+        '<div class="subboard-label">Expanded live intelligence</div>'
+        f'<div class="expanded-coverage">{"".join(cells)}</div>'
+    )
+
+
+def action_queue_panel(items: list[GovernmentRecord]) -> str:
+    """Compact, source-linked queue of official records requiring attention."""
+    if not items:
+        return '<div class="empty">No official records match the current watchlist.</div>'
+    now = datetime.now(CENTRAL)
+    rows = []
+    for index, item in enumerate(items, 1):
+        if item.occurs_at:
+            local_occurs = item.occurs_at.astimezone(CENTRAL)
+            delta = local_occurs - now
+            hours = int(delta.total_seconds() // 3600)
+            if delta.total_seconds() < 0:
+                timing = "Elapsed"
+            elif hours < 24:
+                timing = "Today" if local_occurs.date() == now.date() else f"In {hours}h"
+            else:
+                days = max(1, (local_occurs.date() - now.date()).days)
+                timing = f"In {days}d"
+        elif item.published_at:
+            timing = f"{compact_age(item.published_at)} old"
+        else:
+            timing = "Current"
+        detail = " · ".join(
+            part
+            for part in [item.category, item.agency, item.status, item.identifier]
+            if part
+        )
+        rows.append(
+            f"""<div class="action-row"><span class="action-index">{index:02d}</span><div>
+            <div class="action-title"><a href="{safe_url(item.url)}" target="_blank">
+            {escape(item.title)} ↗</a></div><div class="action-meta">{escape(detail)}</div></div>
+            <span class="action-timing">{escape(timing)}</span></div>"""
+        )
+    return f'<div class="action-queue">{"".join(rows)}</div>'
+
+
+def government_records_csv(items: Iterable[GovernmentRecord]) -> bytes:
+    """Export normalized official records without exposing internal objects."""
+    rows = [
+        {
+            "title": item.title,
+            "category": item.category,
+            "agency": item.agency,
+            "status": item.status,
+            "identifier": item.identifier,
+            "published_at": item.published_at.isoformat() if item.published_at else "",
+            "occurs_at": item.occurs_at.isoformat() if item.occurs_at else "",
+            "value": item.value,
+            "summary": item.summary,
+            "source_url": item.url,
+        }
+        for item in items
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "title",
+            "category",
+            "agency",
+            "status",
+            "identifier",
+            "published_at",
+            "occurs_at",
+            "value",
+            "summary",
+            "source_url",
+        ],
+    ).to_csv(index=False).encode("utf-8-sig")
+
+
 def field_calendar_panel(events: list[PoliticalEvent]) -> str:
     if not events:
         return '<div class="empty">No upcoming Republican events were returned.</div>'
@@ -850,11 +1053,13 @@ def command_center() -> None:
         st.rerun()
     token = configured_x_token()
     base_url = str(get_secret("X_API_BASE_URL", "https://api.x.com") or "https://api.x.com")
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=7) as executor:
         hearing_future = executor.submit(live_hearings)
         headline_future = executor.submit(live_headlines)
         event_future = executor.submit(live_events)
         directory_future = executor.submit(live_directory)
+        government_future = executor.submit(live_government_intelligence)
+        influence_future = executor.submit(live_influence_intelligence)
         directory = directory_future.result()
         accounts = public_feed_accounts(directory.items)
         # With API access, one list request covers every legislator; the anonymous
@@ -866,18 +1071,32 @@ def command_center() -> None:
         hearing_results = hearing_future.result()
         headline_results = headline_future.result()
         event_results = event_future.result()
+        government_results = government_future.result()
+        influence_results = influence_future.result()
         posts = posts_future.result()
     if token and not posts.items:
         posts = live_public_posts(tuple(accounts))
     remember(hearing_results)
     remember(headline_results)
     remember(event_results)
+    remember(government_results)
+    remember(influence_results)
     remember(directory)
     remember(posts)
     hearings = flatten(hearing_results)
     headlines = dedupe_headlines(headline_results)
     events = dedupe_events(event_results)
-    all_results = [*hearing_results, *headline_results, *event_results, directory, posts]
+    government_records: list[GovernmentRecord] = flatten(government_results)
+    influence_records: list[GovernmentRecord] = flatten(influence_results)
+    all_results = [
+        *hearing_results,
+        *headline_results,
+        *event_results,
+        *government_results,
+        *influence_results,
+        directory,
+        posts,
+    ]
     responding = sum(1 for result in all_results if result.freshness != "unavailable")
     st.markdown(
         source_coverage_panel(
@@ -887,6 +1106,47 @@ def command_center() -> None:
     )
     countdown_strip()
     operations_strip(hearings, headlines, events)
+    st.markdown(
+        expanded_intelligence_panel(government_results, influence_results),
+        unsafe_allow_html=True,
+    )
+    watch_query = st.text_input(
+        "Focus watchlist",
+        placeholder="Water, school finance, grid reliability, property tax…",
+        help=(
+            "Enter comma-separated issues, agencies, organizations, docket numbers, "
+            "vendors, or people. The official action queue and downloaded brief will "
+            "focus on matching records."
+        ),
+        key="command_watchlist",
+    )
+    watch_terms = tuple(
+        term.strip() for term in watch_query.split(",") if term.strip()
+    )
+    action_records = select_action_records(
+        [*government_records, *influence_records],
+        now=datetime.now(CENTRAL),
+        limit=8,
+        keywords=watch_terms,
+    )
+    queue_note = (
+        f"Prioritized official records matching {', '.join(watch_terms)}."
+        if watch_terms
+        else "Prioritized by timing, recency, record status, and source significance."
+    )
+    st.markdown(
+        f'<div class="board-kicker">Official action queue</div>'
+        f'<div class="section-note">{escape(queue_note)}</div>'
+        f"{action_queue_panel(action_records)}",
+        unsafe_allow_html=True,
+    )
+    if action_records:
+        st.download_button(
+            "Download action queue (.csv)",
+            government_records_csv(action_records),
+            f"texas-action-queue-{TODAY.isoformat()}.csv",
+            "text/csv",
+        )
     st.markdown(
         f"""<div class="intelligence-grid"><section><div class="board-kicker">Texas Legislature</div>
         <div class="board-title">This Week’s Hearings</div><div class="board-rule"></div>
@@ -922,7 +1182,16 @@ def command_center() -> None:
     with brief_col:
         st.download_button(
             "Download daily brief (.md)",
-            make_briefing(TODAY, hearings, headlines, events, MILESTONES),
+            make_briefing(
+                TODAY,
+                hearings,
+                headlines,
+                events,
+                MILESTONES,
+                government_records,
+                influence_records,
+                watch_terms,
+            ),
             f"texas-daily-brief-{TODAY.isoformat()}.md",
             "text/markdown",
             width="stretch",
@@ -1424,6 +1693,216 @@ def events_page() -> None:
             st.link_button(f"Open {result.source_name} ↗", result.source_url)
 
 
+def government_page() -> None:
+    st.markdown("## Government activity")
+    st.caption(
+        "Official agency meetings, Texas Register rules, governor actions, regulatory matters, "
+        "court orders, election data, and legislative vote surfaces."
+    )
+    results = live_government_intelligence()
+    remember(results)
+    records: list[GovernmentRecord] = flatten(results)
+    now = datetime.now(CENTRAL)
+    upcoming = sum(1 for item in records if item.occurs_at and item.occurs_at >= now)
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        metric("Government records", f"{len(records):,}", "normalized live records")
+    with summary_cols[1]:
+        metric("Upcoming meetings", f"{upcoming:,}", "state and regional agencies")
+    with summary_cols[2]:
+        metric("Agencies", f"{len({x.agency for x in records}):,}", "named authorities")
+    with summary_cols[3]:
+        metric(
+            "Sources online",
+            f"{sum(x.freshness != 'unavailable' for x in results)}/{len(results)}",
+            "responding now",
+        )
+    categories = sorted({item.category for item in records})
+    agencies = sorted({item.agency for item in records})
+    c1, c2, c3, c4 = st.columns([1.25, 1.35, 1, 2])
+    with c1:
+        category = st.selectbox(
+            "Record type", ["All"] + categories, key="government_category"
+        )
+    with c2:
+        agency = st.selectbox("Agency", ["All"] + agencies, key="government_agency")
+    with c3:
+        timing = st.selectbox(
+            "Timing",
+            ["Current and upcoming", "Upcoming only", "Past 30 days", "All"],
+            key="government_timing",
+        )
+    with c4:
+        query = st.text_input(
+            "Search government records",
+            placeholder="Agency, docket, rule, meeting, case, or issue",
+            key="government_query",
+        )
+    cutoff = now - timedelta(days=30)
+    shown: list[GovernmentRecord] = []
+    for item in records:
+        haystack = (
+            f"{item.title} {item.summary} {item.agency} {item.identifier} "
+            f"{item.category} {item.status}"
+        ).lower()
+        timing_match = (
+            timing == "All"
+            or (
+                timing == "Upcoming only"
+                and item.occurs_at is not None
+                and item.occurs_at >= now
+            )
+            or (
+                timing == "Past 30 days"
+                and item.published_at is not None
+                and item.published_at >= cutoff
+            )
+            or (
+                timing == "Current and upcoming"
+                and (
+                    item.occurs_at is None
+                    or item.occurs_at >= now
+                    or (item.published_at is not None and item.published_at >= cutoff)
+                )
+            )
+        )
+        if (
+            (category == "All" or item.category == category)
+            and (agency == "All" or item.agency == agency)
+            and (not query or query.lower() in haystack)
+            and timing_match
+        ):
+            shown.append(item)
+    shown.sort(
+        key=lambda item: (
+            0 if item.occurs_at and item.occurs_at >= now else 1,
+            item.occurs_at.timestamp()
+            if item.occurs_at and item.occurs_at >= now
+            else -(item.published_at.timestamp() if item.published_at else 0),
+        )
+    )
+    st.caption(f"Showing {min(len(shown), 100):,} of {len(shown):,} matching records.")
+    if shown:
+        export_col, calendar_col = st.columns(2)
+        with export_col:
+            st.download_button(
+                "Download matching records (.csv)",
+                government_records_csv(shown),
+                f"texas-government-records-{TODAY.isoformat()}.csv",
+                "text/csv",
+                width="stretch",
+            )
+        with calendar_col:
+            calendar_records = [
+                item for item in shown if item.occurs_at and item.occurs_at >= now
+            ]
+            st.download_button(
+                "Add upcoming dates to calendar (.ics)",
+                make_ics(calendar_records, "Texas government meetings and deadlines"),
+                f"texas-government-calendar-{TODAY.isoformat()}.ics",
+                "text/calendar",
+                width="stretch",
+                disabled=not calendar_records,
+            )
+        for item in shown[:100]:
+            government_record_card(item)
+    else:
+        empty_state("No government records match these filters.")
+    with st.expander("Government sources and freshness"):
+        for result in sorted(results, key=lambda item: item.source_name):
+            status_line(result)
+            st.link_button(f"Open {result.source_name} ↗", result.source_url)
+
+
+def influence_page() -> None:
+    st.markdown("## Influence, disclosures, and contracts")
+    st.caption(
+        "Current TEC direct expenditures, daily lobby registrations, filed lobby-activity "
+        "reports and compensation bands, and active Comptroller contract listings."
+    )
+    results = live_influence_intelligence()
+    remember(results)
+    records: list[GovernmentRecord] = flatten(results)
+    categories = sorted({item.category for item in records})
+    active_lobby = sum(
+        item.category == "Lobby registration" and item.status == "Active"
+        for item in records
+    )
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        metric("Disclosure records", f"{len(records):,}", "current normalized set")
+    with summary_cols[1]:
+        metric("Active lobby records", f"{active_lobby:,}", "client–lobbyist relationships")
+    with summary_cols[2]:
+        metric(
+            "Direct expenditures",
+            f"{sum(item.category == 'Direct campaign expenditure' for item in records):,}",
+            "current-year reports",
+        )
+    with summary_cols[3]:
+        metric(
+            "Public contracts",
+            f"{sum(item.category == 'State contract' for item in records):,}",
+            "active Comptroller listings",
+        )
+    c1, c2, c3 = st.columns([1.2, 1.2, 2.2])
+    with c1:
+        category = st.selectbox(
+            "Disclosure type", ["All"] + categories, key="influence_category"
+        )
+    with c2:
+        state = st.selectbox(
+            "Status",
+            ["All", "Active", "Filed", "Active listing", "Terminated"],
+            key="influence_status",
+        )
+    with c3:
+        query = st.text_input(
+            "Search disclosures",
+            placeholder="Client, lobbyist, filer, vendor, purpose, or report ID",
+            key="influence_query",
+        )
+    shown = [
+        item
+        for item in records
+        if (category == "All" or item.category == category)
+        and (state == "All" or item.status == state)
+        and (
+            not query
+            or query.lower()
+            in f"{item.title} {item.summary} {item.identifier} {item.value}".lower()
+        )
+    ]
+    shown.sort(
+        key=lambda item: (
+            item.published_at.timestamp() if item.published_at else 0,
+            item.title.lower(),
+        ),
+        reverse=True,
+    )
+    st.caption(f"Showing {min(len(shown), 100):,} of {len(shown):,} matching records.")
+    if shown:
+        st.download_button(
+            "Download matching disclosures (.csv)",
+            government_records_csv(shown),
+            f"texas-influence-records-{TODAY.isoformat()}.csv",
+            "text/csv",
+        )
+        for item in shown[:100]:
+            government_record_card(item)
+    else:
+        empty_state("No disclosure records match these filters.")
+    st.info(
+        "Lobby compensation is displayed as the range disclosed to TEC. "
+        "Direct expenditures use TEC's current-year report; the complete transaction archive "
+        "remains linked at the source because it is approximately 1 GB."
+    )
+    with st.expander("Disclosure sources and freshness"):
+        for result in sorted(results, key=lambda item: item.source_name):
+            status_line(result)
+            st.link_button(f"Open {result.source_name} ↗", result.source_url)
+
+
 def source_health_page() -> None:
     st.markdown("## Source health")
     st.caption("Runtime status for authoritative and intelligence feeds checked during this session.")
@@ -1431,10 +1910,32 @@ def source_health_page() -> None:
         with st.spinner("Checking sources…"):
             activity, hearings, headlines, events, finance = load_command_data()
             directory = live_directory()
-            for group in (activity, hearings, headlines, events):
+            government = live_government_intelligence()
+            influence = live_influence_intelligence()
+            token = configured_x_token()
+            base_url = str(
+                get_secret("X_API_BASE_URL", "https://api.x.com") or "https://api.x.com"
+            )
+            accounts = public_feed_accounts(directory.items)
+            posts = (
+                live_x_list_posts(token, base_url)
+                if token
+                else live_public_posts(tuple(accounts))
+            )
+            if token and not posts.items:
+                posts = live_public_posts(tuple(accounts))
+            for group in (
+                activity,
+                hearings,
+                headlines,
+                events,
+                government,
+                influence,
+            ):
                 remember(group)
             remember(finance)
             remember(directory)
+            remember(posts)
     health = st.session_state.get("source_health", {})
     if not health:
         empty_state("No sources have been checked in this session.")
@@ -1465,6 +1966,8 @@ pages = [
     "Command center",
     "Legislature",
     "Campaign finance",
+    "Influence",
+    "Government",
     "Media",
     "Legislators on X",
     "GOP calendar",
@@ -1480,6 +1983,10 @@ elif page == "Legislature":
     legislature_page()
 elif page == "Campaign finance":
     finance_page()
+elif page == "Influence":
+    influence_page()
+elif page == "Government":
+    government_page()
 elif page == "Media":
     headlines_page()
 elif page == "Legislators on X":

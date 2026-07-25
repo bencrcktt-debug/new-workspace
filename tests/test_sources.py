@@ -26,21 +26,34 @@ from data_sources import (
     fetch_headline_feed,
     fetch_social_posts,
     fetch_x_list_posts,
+    government_record_priority,
     headline_relevance,
     headline_priority,
     is_texas_political_story,
     make_briefing,
     make_ics,
     parse_bullpen_daily,
+    parse_budget_updates,
+    parse_contracts,
+    parse_court_order_page,
+    parse_direct_expenditures,
+    parse_election_data_sources,
     parse_finance_workbook,
+    parse_governor_actions,
     parse_ics_events,
+    parse_lobby_roster,
+    parse_lobby_activity,
     parse_lrl_directory,
+    parse_open_meetings,
     parse_indexed_x_posts,
     parse_syndication_timeline,
+    parse_texas_register,
     parse_texan_headlines,
     safe_datetime,
+    select_action_records,
 )
 from models import (
+    GovernmentRecord,
     Headline,
     Hearing,
     LegislatorSocialAccount,
@@ -442,6 +455,16 @@ def test_events_dedupe_and_ics_escape() -> None:
     calendar = make_ics([event], "Texas GOP")
     assert "BEGIN:VEVENT" in calendar
     assert "Hall\\, Room A" in calendar
+    meeting = GovernmentRecord(
+        title="Agency hearing",
+        category="Open meeting",
+        agency="Public Utility Commission",
+        url="https://example.com/agency-hearing",
+        occurs_at=starts,
+    )
+    government_calendar = make_ics([meeting], "Texas government")
+    assert "SUMMARY:Agency hearing" in government_calendar
+    assert "LOCATION:Public Utility Commission" in government_calendar
 
 
 def test_calendar_excludes_events_that_already_ended_their_start_window(
@@ -575,13 +598,43 @@ def test_briefing_compiles_all_sections() -> None:
         datetime(2026, 7, 30, 18, 30, tzinfo=CENTRAL),
         venue="Community Hall",
     )
+    meeting = GovernmentRecord(
+        title="Public Utility Commission open meeting",
+        category="Open meeting",
+        agency="Public Utility Commission of Texas",
+        url="https://example.com/meeting",
+        occurs_at=datetime(2026, 7, 25, 9, tzinfo=CENTRAL),
+        status="Accepted",
+        identifier="TRD-2026001",
+    )
+    expenditure = GovernmentRecord(
+        title="Texans for Reliable Energy",
+        category="Direct campaign expenditure",
+        agency="Texas Ethics Commission",
+        url="https://example.com/expenditure",
+        published_at=datetime(2026, 7, 24, 7, tzinfo=CENTRAL),
+        status="Filed",
+        value="$125,000.00",
+    )
     milestone = Milestone("Texas general election", date(2026, 11, 3), "Election", "https://example.com")
-    brief = make_briefing(today, [hearing], [headline], [event], [milestone])
+    brief = make_briefing(
+        today,
+        [hearing],
+        [headline],
+        [event],
+        [milestone],
+        [meeting],
+        [expenditure],
+    )
     assert "# Texas political intelligence brief — July 24, 2026" in brief
     assert "Texas general election — Nov 03, 2026 (in 102 days)" in brief
     assert "House State Affairs · E1.026 ([notice](https://capitol.texas.gov/notice))" in brief
     assert "[Texas Legislature acts](https://example.com/story) — The Texas Tribune, Jul 23" in brief
     assert "County Club Meeting — Travis County GOP · Community Hall (Austin)" in brief
+    assert "## Official action queue" in brief
+    assert "Public Utility Commission open meeting" in brief
+    assert "## Influence, spending, and contracts" in brief
+    assert "Texans for Reliable Energy" in brief
 
 
 def test_briefing_states_when_sections_are_empty() -> None:
@@ -589,3 +642,202 @@ def test_briefing_states_when_sections_are_empty() -> None:
     assert "No House or Senate committee meetings are posted" in brief
     assert "No fresh attributed reporting was returned." in brief
     assert "No dated Republican field events fall inside the next two weeks." in brief
+    assert "No current official actions were returned." in brief
+    assert "No current disclosure or contract records were returned." in brief
+
+
+def test_action_queue_prioritizes_urgent_records_and_stays_diverse() -> None:
+    now = datetime(2026, 7, 24, 8, tzinfo=CENTRAL)
+    records = [
+        GovernmentRecord(
+            title="Emergency grid reliability meeting",
+            category="Open meeting",
+            agency="Public Utility Commission",
+            url="https://example.com/urgent",
+            occurs_at=datetime(2026, 7, 24, 12, tzinfo=CENTRAL),
+            summary="Emergency meeting",
+            status="Accepted",
+        ),
+        GovernmentRecord(
+            title="Routine meeting next month",
+            category="Open meeting",
+            agency="Routine Agency",
+            url="https://example.com/routine",
+            occurs_at=datetime(2026, 8, 20, 12, tzinfo=CENTRAL),
+            status="Accepted",
+        ),
+        GovernmentRecord(
+            title="Water quality proposed rule",
+            category="Proposed Rules",
+            agency="TCEQ",
+            url="https://example.com/rule",
+            published_at=datetime(2026, 7, 23, 10, tzinfo=CENTRAL),
+            status="Proposed",
+        ),
+        GovernmentRecord(
+            title="Water infrastructure contract",
+            category="State contract",
+            agency="Texas Comptroller",
+            url="https://example.com/contract",
+            value="$4,000,000",
+            status="Active listing",
+        ),
+    ]
+    selected = select_action_records(records, now=now, limit=3)
+    assert selected[0].title == "Emergency grid reliability meeting"
+    assert {item.category for item in selected} == {
+        "Open meeting",
+        "Proposed Rules",
+        "State contract",
+    }
+    water = select_action_records(records, now=now, keywords=["water"])
+    assert {item.title for item in water} == {
+        "Water quality proposed rule",
+        "Water infrastructure contract",
+    }
+    assert government_record_priority(records[0], now) > government_record_priority(
+        records[1], now
+    )
+
+
+def test_open_meetings_parser_normalizes_pending_notice() -> None:
+    body = b"""<html><body><pre>
+Status: Accepted
+TRD: 2026009999
+Related TRD: N/A
+Submitted Date/Time: 7/24/2026 9:30 AM CDT
+Agency Name: Public Utility Commission of Texas
+Board: Commission Open Meeting
+Committee: N/A
+Meeting Date: 7/30/2026
+Meeting Time: 09:30 AM (Local Time)
+Address: 1701 N Congress Ave
+City: Austin
+State: TX
+Additional Information: N/A
+Emergency Meeting: No
+Emergency Reason: N/A
+Agenda: Consideration of posted electric market matters.
+==============================================================================
+</pre></body></html>"""
+    records = parse_open_meetings(body)
+    assert len(records) == 1
+    assert records[0].identifier == "2026009999"
+    assert records[0].agency == "Public Utility Commission of Texas"
+    assert records[0].occurs_at == datetime(2026, 7, 30, 9, 30, tzinfo=CENTRAL)
+
+
+def test_texas_register_parser_tracks_rule_status_and_agency() -> None:
+    body = b"""<html><body>
+    <h1>Texas Register July 24, 2026 Volume 51 Number 30</h1>
+    <h3>PROPOSED RULES</h3>
+    <p><a href="../agency.html">PUBLIC UTILITY COMMISSION OF TEXAS</a></p>
+    <blockquote><a href="../rule.html#1">16 TAC &#167;25.192</a></blockquote>
+    <h3>ADOPTED RULES</h3>
+    <p><a href="../tea.html">TEXAS EDUCATION AGENCY</a></p>
+    <blockquote><a href="../tea-rule.html#2">19 TAC &#167;74.11</a></blockquote>
+    </body></html>"""
+    records = parse_texas_register(body)
+    assert [(item.agency, item.status) for item in records] == [
+        ("PUBLIC UTILITY COMMISSION OF TEXAS", "Proposed"),
+        ("TEXAS EDUCATION AGENCY", "Adopted"),
+    ]
+
+
+def test_direct_expenditure_parser_reads_current_tec_rows() -> None:
+    body = b"""<table>
+    <tr><th>Rank</th><th>IDs</th><th>Filer</th><th>Unitemized</th><th>Itemized</th><th>Date</th></tr>
+    <tr><td>1</td><td>101060602 00091092</td><td>Building Tomorrow Together</td>
+    <td>$10.00</td><td>$112,568.35</td><td>07/15/2026</td></tr>
+    </table>"""
+    records = parse_direct_expenditures(body)
+    assert len(records) == 1
+    assert records[0].title == "Building Tomorrow Together"
+    assert records[0].value == "$112,578.35"
+
+
+def test_lobby_roster_parser_exposes_client_lobbyist_and_disclosed_range() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "Client Name": "Example Energy",
+                "FilerID": 12345,
+                "Lobby Name": "Doe, Jane",
+                "Start": "01/01/2026",
+                "Stop": "12/31/2026",
+                "Method Payment": "PAID",
+                "Amount": "LOBBCOMP03",
+            }
+        ]
+    )
+    output = io.BytesIO()
+    frame.to_excel(output, index=False)
+    records = parse_lobby_roster(output.getvalue())
+    assert len(records) == 1
+    assert records[0].title == "Example Energy — Doe, Jane"
+    assert records[0].value == "$57,220–$114,429.99"
+
+
+def test_lobby_activity_parser_reads_filed_reports() -> None:
+    body = b"""<table class="jrPage">
+    <tr><td>00085404</td><td>Abboud, Andy</td></tr>
+    <tr><td><a href="http://example.com/report.pdf">101056165</a></td>
+    <td>LOBBYACTJUL</td><td>Filed 07/02/2026</td>
+    <td>Covering 2026-06-01 thru 2026-06-30</td></tr>
+    </table>"""
+    records = parse_lobby_activity(body)
+    assert len(records) == 1
+    assert records[0].title == "Abboud, Andy — LOBBYACTJUL"
+    assert records[0].identifier == "00085404 · 101056165"
+
+
+def test_governor_action_parser_keeps_category_and_date() -> None:
+    body = b"""<div class="media-object m-b-4">
+    <div>Jul 24</div><div><h3><a href="/news/post/example-action">
+    Governor Announces Appointment</a></h3>
+    <span>Press Release, Appointment</span></div></div>"""
+    records = parse_governor_actions(
+        body, datetime(2026, 7, 24, 12, tzinfo=CENTRAL)
+    )
+    assert len(records) == 1
+    assert records[0].category == "Appointment"
+    assert records[0].published_at == datetime(2026, 7, 24, tzinfo=CENTRAL)
+
+
+def test_court_parser_creates_case_level_records() -> None:
+    body = b"""<html><body><p>26-0127 EXAMPLE AGENCY v. EXAMPLE COMPANY</p>
+    <p>The Court grants the petition for review.</p></body></html>"""
+    pronounced = datetime(2026, 7, 24, tzinfo=CENTRAL)
+    records = parse_court_order_page(body, "https://example.com/orders", pronounced)
+    assert len(records) == 1
+    assert records[0].identifier == "26-0127"
+    assert records[0].published_at == pronounced
+
+
+def test_election_index_parser_keeps_current_data_products() -> None:
+    body = b"""<html><body>
+    <a href="/turnout">Early Voting Turnout (current)</a>
+    <a href="/results">Historical Election Results</a>
+    </body></html>"""
+    records = parse_election_data_sources(body)
+    assert len(records) == 2
+    assert records[0].agency == "Texas Secretary of State"
+
+
+def test_contract_parser_normalizes_supplier_and_amount() -> None:
+    body = b"""<table><tr><th>Supplier</th><th>PO</th><th>Description</th><th>Amount</th></tr>
+    <tr><td>EXAMPLE VENDOR LLC</td><td>26-1000</td><td>Data services</td><td>$12,500.00</td></tr>
+    </table>"""
+    records = parse_contracts(body)
+    assert len(records) == 1
+    assert records[0].identifier == "26-1000"
+    assert records[0].value == "$12,500.00"
+
+
+def test_budget_update_parser_reads_lbb_publications() -> None:
+    body = b"""<div class="documentslist"><a class="recentDocsLink" href="report.pdf">
+    Fiscal Update</a><br><span>July 22, 2026| Policy Report</span></div>"""
+    records = parse_budget_updates(body)
+    assert len(records) == 1
+    assert records[0].agency == "Legislative Budget Board"
+    assert records[0].summary == "Policy Report"

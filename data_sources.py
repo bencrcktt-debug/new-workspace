@@ -25,6 +25,7 @@ from urllib3.util.retry import Retry
 
 from models import (
     FinanceSummary,
+    GovernmentRecord,
     Headline,
     Hearing,
     LegislativeItem,
@@ -39,6 +40,7 @@ from models import (
 CENTRAL = ZoneInfo("America/Chicago")
 NOW = lambda: datetime.now(CENTRAL)
 T = TypeVar("T")
+CURRENT_YEAR = NOW().year
 
 LRL_X_DIRECTORY = "https://lrl.texas.gov/legeleaders/members/twitterDirectory.cfm"
 LRL_X_LIST = "https://twitter.com/TexasLRL/lists/TxLegislators"
@@ -93,6 +95,8 @@ TLO_FEEDS = {
     "Senate bills filed": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysfiledsenate",
     "House calendars": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=upcomingcalendarshouse",
     "Senate calendars": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=upcomingcalendarssenate",
+    "Fiscal notes": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysfiscalnotes",
+    "Bill analyses": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysbillanalyses",
     "Passed bills": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysbillspassed",
     "Bill text": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=todaysbilltext",
 }
@@ -100,6 +104,43 @@ TLO_HEARING_FEEDS = {
     "House": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=upcomingmeetingshouse",
     "Senate": "https://capitol.texas.gov/MyTLO/RSS/RSS.aspx?Type=upcomingmeetingssenate",
 }
+
+TLO_VOTE_SOURCES = {
+    "House votes by date": "https://capitol.texas.gov/Reports/GeneralVotesByDateHouse.aspx",
+    "Senate votes by date": "https://capitol.texas.gov/Reports/GeneralVotesByDateSenate.aspx",
+    "Bill amendments and companions": "https://capitol.texas.gov/MnuLegislation.aspx",
+}
+
+OPEN_MEETINGS_BACKUP = (
+    "https://texinfo.library.unt.edu/texasregister/openmeetings/OpenMeetings.html"
+)
+OPEN_MEETINGS_PRIMARY = (
+    "https://texas-sos.appianportalsgov.com/rules-and-meetings"
+    "?interface=SEARCH_OPEN_MEETINGS"
+)
+TEXAS_REGISTER_CURRENT = "https://www.sos.state.tx.us/texreg/sos/"
+TEC_DIRECT_EXPENDITURES = (
+    f"https://www.ethics.state.tx.us/search/cf/{CURRENT_YEAR}/"
+    f"DirectExpenditures{CURRENT_YEAR}.html"
+)
+TEC_LOBBY_ROSTER = (
+    f"https://www.ethics.state.tx.us/data/search/lobby/{CURRENT_YEAR}/"
+    f"{CURRENT_YEAR}LobbyGroupByClient.xlsx"
+)
+TEC_LOBBY_HOME = "https://www.ethics.state.tx.us/search/lobby/"
+TEC_LOBBY_ACTIVITY = (
+    f"https://www.ethics.state.tx.us/search/lobby/{CURRENT_YEAR}/"
+    f"LAReportsByYear{CURRENT_YEAR}.html"
+)
+GOVERNOR_NEWS = "https://gov.texas.gov/news"
+SUPREME_COURT_ORDERS = (
+    f"https://www.txcourts.gov/supreme/orders-opinions/{CURRENT_YEAR}/"
+)
+ELECTION_DATA_HOME = "https://www.sos.state.tx.us/elections/historical/index.shtml"
+COMPTROLLER_CONTRACTS = (
+    "https://comptroller.texas.gov/transparency/open-data/cpa-contracts.php"
+)
+LBB_HOME = "https://www.lbb.texas.gov/"
 
 EVENT_SOURCES = (
     {
@@ -1277,6 +1318,826 @@ def dedupe_headlines(results: Iterable[SourceResult[Headline]]) -> list[Headline
     return output
 
 
+def _local_date(value: str, formats: tuple[str, ...]) -> datetime | None:
+    for fmt in formats:
+        try:
+            return datetime.strptime(value.strip(), fmt).replace(tzinfo=CENTRAL)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def parse_open_meetings(body: bytes, limit: int = 300) -> list[GovernmentRecord]:
+    """Parse the Secretary of State's daily backup of pending meeting notices."""
+    text = BeautifulSoup(body, "html.parser").get_text("\n", strip=True)
+    labels = (
+        "Status",
+        "TRD",
+        "Related TRD",
+        "Submitted Date/Time",
+        "Agency Name",
+        "Board",
+        "Committee",
+        "Meeting Date",
+        "Meeting Time",
+        "Address",
+        "City",
+        "State",
+        "Additional Information",
+        "Emergency Meeting",
+        "Emergency Reason",
+        "Agenda",
+    )
+    marker = "|".join(re.escape(label) for label in labels)
+    records: list[GovernmentRecord] = []
+    seen: set[str] = set()
+    for block in re.split(r"={20,}", text):
+        values: dict[str, str] = {}
+        for label in labels:
+            match = re.search(
+                rf"(?:^|\n){re.escape(label)}:\s*(.*?)(?=\n(?:{marker}):|\Z)",
+                block,
+                re.S,
+            )
+            values[label] = clean_text(match.group(1)) if match else ""
+        trd = values["TRD"]
+        agency = values["Agency Name"]
+        meeting_date = values["Meeting Date"]
+        if not trd or not agency or not meeting_date or trd in seen:
+            continue
+        starts_at = _local_date(
+            f"{meeting_date} {values['Meeting Time'].replace('(Local Time)', '').strip()}",
+            ("%m/%d/%Y %I:%M %p", "%m/%d/%Y"),
+        )
+        title = next(
+            (
+                candidate
+                for candidate in (values["Board"], values["Committee"], agency)
+                if candidate and candidate.upper() != "N/A"
+            ),
+            agency,
+        )
+        agenda = values["Agenda"]
+        location = ", ".join(
+            value
+            for value in (values["Address"], values["City"], values["State"])
+            if value and value.upper() != "N/A"
+        )
+        summary = agenda[:420]
+        if location:
+            summary = f"{location} — {summary}" if summary else location
+        status = values["Status"] or "Filed"
+        if values["Emergency Meeting"].lower() == "yes":
+            status = f"{status} · Emergency"
+        submitted = _local_date(
+            re.sub(r"\s+C[DS]T$", "", values["Submitted Date/Time"]),
+            ("%m/%d/%Y %I:%M %p",),
+        )
+        records.append(
+            GovernmentRecord(
+                title=title,
+                category="Open meeting",
+                agency=agency,
+                url=OPEN_MEETINGS_PRIMARY,
+                published_at=submitted,
+                occurs_at=starts_at,
+                summary=summary,
+                status=status,
+                identifier=trd,
+            )
+        )
+        seen.add(trd)
+        if len(records) >= limit:
+            break
+    records.sort(
+        key=lambda item: item.occurs_at.timestamp() if item.occurs_at else float("inf")
+    )
+    return records
+
+
+def fetch_open_meetings() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(OPEN_MEETINGS_BACKUP)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_open_meetings(body)
+        except Exception:
+            error = "The statewide open-meetings bulletin format could not be read."
+    return _result(
+        "Texas statewide open meetings",
+        OPEN_MEETINGS_BACKUP,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def parse_texas_register(body: bytes, source_url: str = TEXAS_REGISTER_CURRENT) -> list[GovernmentRecord]:
+    """Normalize the current Texas Register table of contents."""
+    soup = BeautifulSoup(body, "html.parser")
+    issue_text = soup.find("h1").get_text(" ", strip=True) if soup.find("h1") else ""
+    issue_match = re.search(
+        r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+        r"\s+\d{1,2},\s+\d{4}",
+        issue_text,
+    )
+    published = (
+        _local_date(issue_match.group(0), ("%B %d, %Y",)) if issue_match else None
+    )
+    category = ""
+    agency = ""
+    records: list[GovernmentRecord] = []
+    seen: set[tuple[str, str]] = set()
+    rule_sections = {"PROPOSED RULES", "ADOPTED RULES", "REVIEW OF AGENCY RULES"}
+    for anchor in soup.select("a[href]"):
+        heading = anchor.find_previous("h3")
+        next_category = (
+            clean_text(heading.get_text(" ", strip=True)).upper() if heading else ""
+        )
+        if next_category != category:
+            category = next_category
+            agency = ""
+        title = clean_text(anchor.get_text(" ", strip=True))
+        is_rule = bool(re.search(r"\b\d+\s+TAC\s+§", title, re.I))
+        if (
+            title
+            and title == title.upper()
+            and not is_rule
+            and category in rule_sections
+            and anchor.parent is not None
+            and anchor.parent.name == "p"
+            and len(title) > 4
+        ):
+            agency = title
+            continue
+        url = urljoin(source_url, anchor["href"])
+        is_front_matter = category in {"THE GOVERNOR", "ATTORNEY GENERAL"}
+        if not title or not (is_rule or is_front_matter):
+            continue
+        key = (title, url)
+        if key in seen:
+            continue
+        record_category = category.title() if category else "Texas Register"
+        status = {
+            "PROPOSED RULES": "Proposed",
+            "ADOPTED RULES": "Adopted",
+            "REVIEW OF AGENCY RULES": "Under review",
+        }.get(category, "Published")
+        container = anchor.find_parent("div")
+        container_text = (
+            clean_text(container.get_text(" ", strip=True)) if container else ""
+        )
+        trd_matches = re.findall(r"\bTRD-\d+\b", container_text)
+        identifier = (
+            f"{trd_matches[-1]} · {title}"
+            if is_rule and trd_matches
+            else title
+            if is_rule
+            else ""
+        )
+        records.append(
+            GovernmentRecord(
+                title=title,
+                category=record_category,
+                agency=agency or category.title() or "Texas Register",
+                url=url,
+                published_at=published,
+                summary=f"{issue_text} · Official Texas Register filing.",
+                status=status,
+                identifier=identifier,
+            )
+        )
+        seen.add(key)
+    return records
+
+
+def fetch_texas_register() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(TEXAS_REGISTER_CURRENT)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_texas_register(body)
+        except Exception:
+            error = "The current Texas Register issue could not be read."
+    return _result(
+        "Texas Register",
+        TEXAS_REGISTER_CURRENT,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def _money_number(value: str) -> float:
+    try:
+        return float(re.sub(r"[^0-9.-]", "", value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_direct_expenditures(body: bytes, limit: int = 250) -> list[GovernmentRecord]:
+    """Parse TEC's current direct-campaign-expenditure report without the 1 GB archive."""
+    records: list[GovernmentRecord] = []
+    seen: set[str] = set()
+    for frame in pd.read_html(io.BytesIO(body)):
+        for _, row in frame.iterrows():
+            values: list[str] = []
+            for raw in row.tolist():
+                value = clean_text("" if pd.isna(raw) else str(raw))
+                if value and value.lower() != "nan" and value not in values:
+                    values.append(value)
+            date_value = next(
+                (value for value in values if re.fullmatch(r"\d{2}/\d{2}/\d{4}", value)),
+                "",
+            )
+            money = [value for value in values if re.fullmatch(r"\$[\d,]+\.\d{2}|\$0", value)]
+            identifiers = next(
+                (
+                    value
+                    for value in values
+                    if re.fullmatch(r"\d{8,9}\s+\d{8}", value)
+                ),
+                "",
+            )
+            if not date_value or len(money) < 2 or not identifiers:
+                continue
+            id_index = values.index(identifiers)
+            name = values[id_index + 1] if id_index + 1 < len(values) else ""
+            if not name or identifiers in seen:
+                continue
+            unitemized, itemized = money[0], money[1]
+            total = _money_number(unitemized) + _money_number(itemized)
+            records.append(
+                GovernmentRecord(
+                    title=name,
+                    category="Direct campaign expenditure",
+                    agency="Texas Ethics Commission",
+                    url=TEC_DIRECT_EXPENDITURES,
+                    published_at=_local_date(date_value, ("%m/%d/%Y",)),
+                    summary=f"Itemized {itemized} · Unitemized {unitemized}",
+                    status="Filed",
+                    identifier=identifiers,
+                    value=f"${total:,.2f}",
+                )
+            )
+            seen.add(identifiers)
+    records.sort(
+        key=lambda item: item.published_at.timestamp() if item.published_at else 0,
+        reverse=True,
+    )
+    return records[:limit]
+
+
+def fetch_direct_expenditures() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(TEC_DIRECT_EXPENDITURES)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_direct_expenditures(body)
+        except Exception:
+            error = "The current TEC direct-expenditure report could not be read."
+    return _result(
+        "TEC direct expenditures",
+        TEC_DIRECT_EXPENDITURES,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+LOBBY_COMPENSATION = {
+    "LOBBCOMPEQZERO": "$0",
+    "LOBBCOMP01": "Under $22,890",
+    "LOBBCOMP02": "$22,890–$57,219.99",
+    "LOBBCOMP03": "$57,220–$114,429.99",
+    "LOBBCOMP04": "$114,430–$228,869.99",
+    "LOBBCOMP05": "$228,870–$343,299.99",
+    "LOBBCOMP06": "$343,300–$457,729.99",
+    "LOBBCOMP07": "$457,730–$572,159.99",
+    "LOBBCOMP08": "$572,160–$686,599.99",
+    "LOBBCOMP09": "$686,600–$801,029.99",
+    "LOBBCOMP10": "$801,030–$915,459.99",
+    "LOBBCOMP11": "$915,460–$1,029,889.99",
+    "LOBBCOMP12": "$1,029,890–$1,144,329.99",
+    "LOBBCOMP13": "$1,144,330 or more",
+    "LOBBCOMPEXACTAMT": "Exact amount disclosed",
+}
+
+
+def parse_lobby_roster(body: bytes, limit: int = 10000) -> list[GovernmentRecord]:
+    frame = pd.read_excel(io.BytesIO(body))
+    required = {"Client Name", "FilerID", "Lobby Name", "Start", "Stop", "Method Payment", "Amount"}
+    if not required.issubset(frame.columns):
+        raise ValueError("The TEC lobby roster schema changed.")
+    records: list[GovernmentRecord] = []
+    today = NOW().date()
+    for _, row in frame.iterrows():
+        client = clean_text(str(row.get("Client Name", "")))
+        lobbyist = clean_text(str(row.get("Lobby Name", "")))
+        if not client or not lobbyist or client.lower() == "nan" or lobbyist.lower() == "nan":
+            continue
+        start = _local_date(str(row.get("Start", "")), ("%m/%d/%Y",))
+        stop = _local_date(str(row.get("Stop", "")), ("%m/%d/%Y",))
+        status = "Active" if not stop or stop.date() >= today else "Terminated"
+        method = clean_text(str(row.get("Method Payment", "")))
+        code = clean_text(str(row.get("Amount", "")))
+        filer_id = clean_text(str(row.get("FilerID", "")))
+        records.append(
+            GovernmentRecord(
+                title=f"{client} — {lobbyist}",
+                category="Lobby registration",
+                agency="Texas Ethics Commission",
+                url=TEC_LOBBY_HOME,
+                published_at=start,
+                occurs_at=stop,
+                summary=f"{method.title()} compensation disclosure" if method else "Lobby registration",
+                status=status,
+                identifier=filer_id,
+                value=LOBBY_COMPENSATION.get(code, code),
+            )
+        )
+    records.sort(
+        key=lambda item: (
+            item.status == "Active",
+            item.published_at.timestamp() if item.published_at else 0,
+        ),
+        reverse=True,
+    )
+    return records[:limit]
+
+
+def fetch_lobby_roster() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(TEC_LOBBY_ROSTER)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_lobby_roster(body)
+        except Exception:
+            error = "The current TEC lobby-registration workbook could not be read."
+    return _result(
+        "TEC lobby registrations",
+        TEC_LOBBY_ROSTER,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def parse_lobby_activity(body: bytes, limit: int = 10000) -> list[GovernmentRecord]:
+    soup = BeautifulSoup(body, "html.parser")
+    table = soup.select_one("table.jrPage")
+    if not table:
+        return []
+    records: list[GovernmentRecord] = []
+    lobbyist = ""
+    filer_id = ""
+    for row in table.select("tr"):
+        values: list[str] = []
+        for cell in row.select(":scope > td"):
+            value = clean_text(cell.get_text(" ", strip=True))
+            if value and value not in values:
+                values.append(value)
+        if (
+            len(values) == 2
+            and re.fullmatch(r"\d{8}", values[0])
+            and not values[1].startswith("LOBBYACT")
+        ):
+            filer_id, lobbyist = values
+            continue
+        if (
+            len(values) < 4
+            or not lobbyist
+            or not re.fullmatch(r"\d{9}", values[0])
+            or not values[1].startswith("LOBBYACT")
+        ):
+            continue
+        report_id, report_type, filed_text, covering = values[:4]
+        filed_match = re.search(r"\d{2}/\d{2}/\d{4}", filed_text)
+        records.append(
+            GovernmentRecord(
+                title=f"{lobbyist} — {report_type}",
+                category="Lobby activity report",
+                agency="Texas Ethics Commission",
+                url=TEC_LOBBY_ACTIVITY,
+                published_at=(
+                    _local_date(filed_match.group(0), ("%m/%d/%Y",))
+                    if filed_match
+                    else None
+                ),
+                summary=covering,
+                status="Filed",
+                identifier=f"{filer_id} · {report_id}",
+            )
+        )
+        if len(records) >= limit:
+            break
+    records.sort(
+        key=lambda item: item.published_at.timestamp() if item.published_at else 0,
+        reverse=True,
+    )
+    return records
+
+
+def fetch_lobby_activity() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(TEC_LOBBY_ACTIVITY)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_lobby_activity(body)
+        except Exception:
+            error = "The current TEC lobby-activity report list could not be read."
+    return _result(
+        "TEC lobby activity reports",
+        TEC_LOBBY_ACTIVITY,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def parse_governor_actions(body: bytes, now: datetime | None = None) -> list[GovernmentRecord]:
+    soup = BeautifulSoup(body, "html.parser")
+    current = now or NOW()
+    records: list[GovernmentRecord] = []
+    seen: set[str] = set()
+    for block in soup.select("div.media-object.m-b-4"):
+        anchor = block.select_one('a[href*="/news/post/"]')
+        if not anchor:
+            continue
+        title = clean_text(anchor.get_text(" ", strip=True))
+        url = urljoin(GOVERNOR_NEWS, anchor.get("href", ""))
+        if not title or url in seen:
+            continue
+        text = clean_text(block.get_text(" ", strip=True))
+        date_match = re.search(
+            r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\b",
+            text,
+        )
+        published = (
+            _local_date(f"{date_match.group(0)} {current.year}", ("%b %d %Y",))
+            if date_match
+            else None
+        )
+        if published and published > current + timedelta(days=7):
+            published = published.replace(year=published.year - 1)
+        categories = [
+            value
+            for value in ("Appointment", "Proclamation", "Legislative Statement", "Press Release")
+            if value.lower() in text.lower()
+        ]
+        category = categories[0] if categories else "Governor action"
+        records.append(
+            GovernmentRecord(
+                title=title,
+                category=category,
+                agency="Office of the Governor",
+                url=url,
+                published_at=published,
+                summary=" · ".join(categories) or "Official governor news release",
+                status="Published",
+            )
+        )
+        seen.add(url)
+    return records
+
+
+def fetch_governor_actions() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(GOVERNOR_NEWS)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_governor_actions(body)
+        except Exception:
+            error = "The governor's current action feed could not be read."
+    return _result(
+        "Governor actions",
+        GOVERNOR_NEWS,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def parse_court_order_page(
+    body: bytes, source_url: str, pronounced_at: datetime | None
+) -> list[GovernmentRecord]:
+    text = BeautifulSoup(body, "html.parser").get_text("\n", strip=True)
+    lines = [clean_text(line) for line in text.splitlines() if clean_text(line)]
+    records: list[GovernmentRecord] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\d{2}-\d{4})(?:\s+(.+))?$", line)
+        if not match:
+            continue
+        case_id, inline_title = match.groups()
+        title = inline_title or (lines[index + 1] if index + 1 < len(lines) else case_id)
+        context_start = index + 1 if inline_title else index + 2
+        context = " ".join(lines[context_start : context_start + 3])
+        records.append(
+            GovernmentRecord(
+                title=title[:300],
+                category="Court order or opinion",
+                agency="Supreme Court of Texas",
+                url=source_url,
+                published_at=pronounced_at,
+                summary=context[:420],
+                status="Issued",
+                identifier=case_id,
+            )
+        )
+    if not records and pronounced_at:
+        records.append(
+            GovernmentRecord(
+                title=f"Supreme Court orders pronounced {pronounced_at.strftime('%B %d, %Y')}",
+                category="Court orders",
+                agency="Supreme Court of Texas",
+                url=source_url,
+                published_at=pronounced_at,
+                summary="Official orders and opinions issued by the Supreme Court of Texas.",
+                status="Issued",
+            )
+        )
+    return records
+
+
+def fetch_court_activity(days: int = 5) -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(SUPREME_COURT_ORDERS)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            soup = BeautifulSoup(body, "html.parser")
+            dated: list[tuple[datetime, str]] = []
+            for anchor in soup.select('a[href*="/orders-opinions/"]'):
+                published = _local_date(
+                    clean_text(anchor.get_text(" ", strip=True)), ("%B %d, %Y",)
+                )
+                if published:
+                    dated.append((published, urljoin(SUPREME_COURT_ORDERS, anchor["href"])))
+            dated = sorted(set(dated), key=lambda item: item[0], reverse=True)[:days]
+            for published, url in dated:
+                page, page_stale, page_latency, _ = CLIENT.get(url)
+                stale = stale or page_stale
+                latency = max(latency, page_latency)
+                if page:
+                    items.extend(parse_court_order_page(page, url, published))
+        except Exception:
+            error = "The current Texas Supreme Court order pages could not be read."
+    items.sort(
+        key=lambda item: item.published_at.timestamp() if item.published_at else 0,
+        reverse=True,
+    )
+    return _result(
+        "Texas Supreme Court",
+        SUPREME_COURT_ORDERS,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def parse_election_data_sources(body: bytes) -> list[GovernmentRecord]:
+    soup = BeautifulSoup(body, "html.parser")
+    wanted = (
+        "Early Voting Turnout (current)",
+        "Election Day Voting Turnout",
+        "Historical Election Results",
+        "Voter Registration Figures",
+        "Voter Registration and Unofficial Early Voting Figures by County",
+    )
+    records: list[GovernmentRecord] = []
+    seen: set[str] = set()
+    for anchor in soup.select("a[href]"):
+        title = clean_text(anchor.get_text(" ", strip=True))
+        if not any(value.lower() in title.lower() for value in wanted):
+            continue
+        url = urljoin(ELECTION_DATA_HOME, anchor["href"])
+        if url in seen:
+            continue
+        status = "Unofficial when active" if "unofficial" in title.lower() or "turnout" in title.lower() else "Official"
+        records.append(
+            GovernmentRecord(
+                title=title,
+                category="Election and turnout data",
+                agency="Texas Secretary of State",
+                url=url,
+                summary="Current statewide election, turnout, or registration data product.",
+                status=status,
+            )
+        )
+        seen.add(url)
+    return records
+
+
+def fetch_election_data() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(ELECTION_DATA_HOME)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_election_data_sources(body)
+        except Exception:
+            error = "The Secretary of State election-data index could not be read."
+    return _result(
+        "Texas election data",
+        ELECTION_DATA_HOME,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def parse_contracts(body: bytes, limit: int = 2000) -> list[GovernmentRecord]:
+    soup = BeautifulSoup(body, "html.parser")
+    records: list[GovernmentRecord] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in soup.select("table tr"):
+        cells = [
+            clean_text(cell.get_text(" ", strip=True))
+            for cell in row.select("th,td")
+        ]
+        if len(cells) < 4:
+            continue
+        supplier, purchase_order, description, amount = cells[:4]
+        if supplier.lower() in {"supplier", "supplier name"} or purchase_order.lower() == "po":
+            continue
+        key = (supplier, purchase_order, description)
+        if not supplier or not description or key in seen:
+            continue
+        records.append(
+            GovernmentRecord(
+                title=description,
+                category="State contract",
+                agency="Texas Comptroller of Public Accounts",
+                url=COMPTROLLER_CONTRACTS,
+                summary=f"{supplier} · Purchase order {purchase_order}",
+                status="Active listing",
+                identifier=purchase_order,
+                value=amount,
+            )
+        )
+        seen.add(key)
+        if len(records) >= limit:
+            break
+    return records
+
+
+def fetch_contracts() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(COMPTROLLER_CONTRACTS)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_contracts(body)
+        except Exception:
+            error = "The Comptroller's current public-contract listing could not be read."
+    return _result(
+        "Texas public contracts",
+        COMPTROLLER_CONTRACTS,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def parse_budget_updates(body: bytes) -> list[GovernmentRecord]:
+    soup = BeautifulSoup(body, "html.parser")
+    records: list[GovernmentRecord] = []
+    for anchor in soup.select(".documentslist a.recentDocsLink[href]"):
+        title = clean_text(anchor.get_text(" ", strip=True))
+        detail = anchor.find_next_sibling("span")
+        detail_text = clean_text(detail.get_text(" ", strip=True)) if detail else ""
+        date_match = re.search(
+            r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+            r"\s+\d{1,2},\s+\d{4}",
+            detail_text,
+        )
+        published = (
+            _local_date(date_match.group(0), ("%B %d, %Y",)) if date_match else None
+        )
+        document_type = (
+            detail_text.split("|", 1)[1].strip()
+            if "|" in detail_text
+            else "Budget publication"
+        )
+        records.append(
+            GovernmentRecord(
+                title=title,
+                category="Budget and fiscal update",
+                agency="Legislative Budget Board",
+                url=urljoin(LBB_HOME, anchor["href"]),
+                published_at=published,
+                summary=document_type,
+                status="Published",
+            )
+        )
+    return records
+
+
+def fetch_budget_updates() -> SourceResult[GovernmentRecord]:
+    body, stale, latency, error = CLIENT.get(LBB_HOME)
+    items: list[GovernmentRecord] = []
+    if body:
+        try:
+            items = parse_budget_updates(body)
+        except Exception:
+            error = "The Legislative Budget Board's current publications could not be read."
+    return _result(
+        "Legislative Budget Board",
+        LBB_HOME,
+        items,
+        stale,
+        latency,
+        error,
+    )
+
+
+def fetch_vote_sources() -> SourceResult[GovernmentRecord]:
+    """Expose official vote and amendment search surfaces as live source records."""
+    items = [
+        GovernmentRecord(
+            title=name,
+            category="Legislative votes and amendments",
+            agency="Texas Legislature Online",
+            url=url,
+            summary="Official current-session search maintained by Texas Legislature Online.",
+            status="Available",
+        )
+        for name, url in TLO_VOTE_SOURCES.items()
+    ]
+    return SourceResult(
+        source_name="TLO votes and amendments",
+        source_url="https://capitol.texas.gov/BillLookup/VoteInfo.aspx",
+        items=items,
+        fetched_at=NOW(),
+        freshness="live",
+    )
+
+
+def fetch_regulatory_dockets() -> SourceResult[GovernmentRecord]:
+    """Discover current regulatory matters from the official Texas Register issue."""
+    register = fetch_texas_register()
+    keywords = (
+        "PUBLIC UTILITY COMMISSION",
+        "RAILROAD COMMISSION",
+        "COMMISSION ON ENVIRONMENTAL QUALITY",
+        "DEPARTMENT OF INSURANCE",
+    )
+    items = [
+        GovernmentRecord(
+            title=item.title,
+            category="Regulatory docket",
+            agency=item.agency,
+            url=item.url,
+            published_at=item.published_at,
+            summary=item.summary,
+            status=item.status,
+            identifier=item.identifier,
+        )
+        for item in register.items
+        if any(keyword in item.agency.upper() for keyword in keywords)
+    ]
+    return SourceResult(
+        source_name="Texas regulatory dockets",
+        source_url=TEXAS_REGISTER_CURRENT,
+        items=items,
+        fetched_at=register.fetched_at,
+        freshness=register.freshness,
+        latency_ms=register.latency_ms,
+        error=register.error,
+    )
+
+
+def fetch_government_intelligence() -> list[SourceResult[GovernmentRecord]]:
+    calls: list[tuple[str, Callable[[], SourceResult[GovernmentRecord]]]] = [
+        ("Open meetings", fetch_open_meetings),
+        ("Texas Register", fetch_texas_register),
+        ("Governor actions", fetch_governor_actions),
+        ("Regulatory dockets", fetch_regulatory_dockets),
+        ("Courts", fetch_court_activity),
+        ("Election data", fetch_election_data),
+        ("Budget updates", fetch_budget_updates),
+        ("Votes", fetch_vote_sources),
+    ]
+    return _parallel(calls)
+
+
+def fetch_influence_intelligence() -> list[SourceResult[GovernmentRecord]]:
+    return _parallel(
+        [
+            ("Direct expenditures", fetch_direct_expenditures),
+            ("Lobby registrations", fetch_lobby_roster),
+            ("Lobby activity", fetch_lobby_activity),
+            ("Public contracts", fetch_contracts),
+        ]
+    )
+
+
 def _event_type(title: str) -> str:
     lowered = title.lower()
     if "women" in lowered:
@@ -1553,7 +2414,132 @@ def _parallel(calls: list[tuple[str, Callable[[], T]]]) -> list[T]:
     return results
 
 
-def make_ics(events: Iterable[PoliticalEvent | Hearing], calendar_name: str) -> str:
+def government_record_priority(
+    item: GovernmentRecord, now: datetime | None = None
+) -> int:
+    """Rank an official record by urgency, recency, and policy significance."""
+    reference = now or NOW()
+    category_score = {
+        "Open meeting": 42,
+        "Regulatory docket": 36,
+        "Proposed Rules": 34,
+        "Adopted Rules": 28,
+        "Review Of Agency Rules": 26,
+        "Court order or opinion": 26,
+        "Court orders": 24,
+        "Direct campaign expenditure": 24,
+        "Budget and fiscal update": 22,
+        "Appointment": 22,
+        "Proclamation": 20,
+        "Legislative Statement": 24,
+        "Press Release": 16,
+        "Lobby activity report": 17,
+        "State contract": 16,
+        "Election and turnout data": 15,
+        "Legislative votes and amendments": 14,
+        "Lobby registration": 8,
+    }.get(item.category, 18)
+    score = category_score
+    status = item.status.lower()
+    if "emergency" in status or "emergency" in item.summary.lower():
+        score += 28
+    if "proposed" in status:
+        score += 18
+    elif "adopted" in status or "issued" in status:
+        score += 12
+    elif "filed" in status:
+        score += 8
+
+    if item.occurs_at:
+        hours = (item.occurs_at.astimezone(CENTRAL) - reference).total_seconds() / 3600
+        if 0 <= hours <= 24:
+            score += 55
+        elif hours <= 72 and hours >= 0:
+            score += 42
+        elif hours <= 168 and hours >= 0:
+            score += 30
+        elif hours <= 720 and hours >= 0:
+            score += 14
+        elif hours < 0:
+            score -= 30
+    if item.published_at:
+        age_hours = (
+            reference - item.published_at.astimezone(CENTRAL)
+        ).total_seconds() / 3600
+        if 0 <= age_hours <= 24:
+            score += 24
+        elif age_hours <= 168 and age_hours >= 0:
+            score += 15
+        elif age_hours <= 720 and age_hours >= 0:
+            score += 7
+    if item.identifier:
+        score += 2
+    if item.value:
+        score += 3
+    return score
+
+
+def select_action_records(
+    records: Iterable[GovernmentRecord],
+    now: datetime | None = None,
+    limit: int = 8,
+    keywords: Iterable[str] = (),
+) -> list[GovernmentRecord]:
+    """Return a diverse, deduplicated queue of records that merit review."""
+    reference = now or NOW()
+    terms = tuple(term.strip().lower() for term in keywords if term.strip())
+    ranked: list[tuple[int, GovernmentRecord]] = []
+    seen: set[str] = set()
+    for item in records:
+        text = (
+            f"{item.title} {item.summary} {item.agency} {item.category} "
+            f"{item.status} {item.identifier} {item.value}"
+        ).lower()
+        if terms and not any(term in text for term in terms):
+            continue
+        if (
+            item.category == "Open meeting"
+            and item.occurs_at
+            and item.occurs_at.astimezone(CENTRAL) < reference
+        ):
+            continue
+        key = f"{item.url}|{item.identifier or item.title}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append((government_record_priority(item, reference), item))
+    ranked.sort(
+        key=lambda pair: (
+            -pair[0],
+            pair[1].occurs_at.timestamp() if pair[1].occurs_at else float("inf"),
+            -(pair[1].published_at.timestamp() if pair[1].published_at else 0),
+            pair[1].title.lower(),
+        )
+    )
+
+    selected: list[GovernmentRecord] = []
+    overflow: list[GovernmentRecord] = []
+    category_counts: dict[str, int] = {}
+    category_cap = 2 if terms else 1
+    for _, item in ranked:
+        if category_counts.get(item.category, 0) >= category_cap:
+            overflow.append(item)
+            continue
+        selected.append(item)
+        category_counts[item.category] = category_counts.get(item.category, 0) + 1
+        if len(selected) >= limit:
+            return selected
+    for item in overflow:
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def make_ics(
+    events: Iterable[PoliticalEvent | Hearing | GovernmentRecord],
+    calendar_name: str,
+) -> str:
     def fmt(value: datetime | None) -> str:
         chosen = value or NOW()
         return chosen.astimezone(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
@@ -1566,11 +2552,20 @@ def make_ics(events: Iterable[PoliticalEvent | Hearing], calendar_name: str) -> 
     ]
     for item in events:
         title = item.title
-        start = item.starts_at
+        start = getattr(item, "starts_at", None) or getattr(item, "occurs_at", None)
+        if not start:
+            continue
         end = getattr(item, "ends_at", None) or (start + timedelta(hours=1) if start else None)
         url = item.url
         location = " ".join(
-            x for x in [getattr(item, "venue", ""), getattr(item, "address", ""), getattr(item, "location", "")] if x
+            x
+            for x in [
+                getattr(item, "venue", ""),
+                getattr(item, "address", ""),
+                getattr(item, "location", ""),
+                getattr(item, "agency", ""),
+            ]
+            if x
         )
         uid = hashlib.sha1(f"{title}|{start}|{url}".encode()).hexdigest()
         lines.extend(
@@ -1604,8 +2599,12 @@ def make_briefing(
     headlines: Iterable[Headline],
     events: Iterable[PoliticalEvent],
     milestones: Iterable[Milestone] = (),
+    government_records: Iterable[GovernmentRecord] = (),
+    influence_records: Iterable[GovernmentRecord] = (),
+    watch_terms: Iterable[str] = (),
 ) -> str:
     """A shareable Markdown daily brief compiled from already-fetched records."""
+    normalized_watch_terms = tuple(watch_terms)
     lines = [
         f"# Texas political intelligence brief — {today.strftime('%B %d, %Y')}",
         "",
@@ -1648,6 +2647,33 @@ def make_briefing(
             "- No House or Senate committee meetings are posted for the next seven days."
         )
 
+    reference = datetime.combine(today, datetime.min.time(), tzinfo=CENTRAL) + timedelta(
+        hours=8
+    )
+    official_actions = select_action_records(
+        government_records,
+        now=reference,
+        limit=10,
+        keywords=normalized_watch_terms,
+    )
+    lines += ["", "## Official action queue"]
+    if official_actions:
+        for item in official_actions:
+            if item.occurs_at:
+                timing = _brief_when(item.occurs_at)
+            elif item.published_at:
+                timing = item.published_at.astimezone(CENTRAL).strftime("%b %d")
+            else:
+                timing = "current"
+            identifier = f" · {item.identifier}" if item.identifier else ""
+            lines.append(
+                f"- [{item.title}]({item.url}) — {item.agency} · {timing}"
+                f" · {item.status or item.category}{identifier}"
+            )
+    else:
+        suffix = " matching the watchlist" if normalized_watch_terms else ""
+        lines.append(f"- No current official actions were returned{suffix}.")
+
     lines += ["", "## Top headlines"]
     top_headlines = list(headlines)[:10]
     if top_headlines:
@@ -1677,4 +2703,26 @@ def make_briefing(
             )
     else:
         lines.append("- No dated Republican field events fall inside the next two weeks.")
+
+    influence_actions = select_action_records(
+        influence_records,
+        now=reference,
+        limit=8,
+        keywords=normalized_watch_terms,
+    )
+    lines += ["", "## Influence, spending, and contracts"]
+    if influence_actions:
+        for item in influence_actions:
+            timing = (
+                item.published_at.astimezone(CENTRAL).strftime("%b %d")
+                if item.published_at
+                else "current"
+            )
+            value = f" · {item.value}" if item.value else ""
+            lines.append(
+                f"- [{item.title}]({item.url}) — {item.category} · {timing}{value}"
+            )
+    else:
+        suffix = " matching the watchlist" if normalized_watch_terms else ""
+        lines.append(f"- No current disclosure or contract records were returned{suffix}.")
     return "\n".join(lines) + "\n"

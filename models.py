@@ -91,6 +91,22 @@ class PoliticalEvent:
 
 
 @dataclass(frozen=True)
+class GovernmentRecord:
+    """Normalized public record from a government, regulatory, or disclosure source."""
+
+    title: str
+    category: str
+    agency: str
+    url: str
+    published_at: datetime | None = None
+    occurs_at: datetime | None = None
+    summary: str = ""
+    status: str = ""
+    identifier: str = ""
+    value: str = ""
+
+
+@dataclass(frozen=True)
 class Milestone:
     name: str
     occurs_on: date

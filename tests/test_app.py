@@ -10,6 +10,8 @@ def test_all_navigation_sections_render() -> None:
         "Command center",
         "Legislature",
         "Campaign finance",
+        "Influence",
+        "Government",
         "Media",
         "Legislators on X",
         "GOP calendar",
