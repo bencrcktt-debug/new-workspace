@@ -20,8 +20,11 @@ A responsive Texas legislative and Republican political-intelligence dashboard f
 - Optional token-based, account-filtered X posts (X API v2) for a bounded selection of legislators
 - Republican Party and club events across Austin, Dallas–Fort Worth, Houston, San Antonio, and statewide sources, presented as a filterable day-by-day agenda
 - Runtime freshness, latency, record counts, and fallback status for every checked source
+- A dedicated **Watchlist radar** that tracks issues, agencies, bill numbers, organizations, people, vendors, and dockets across official action, legislative activity, hearings, media, GOP events, and public legislator posts
 
 The command center also assembles a one-click **daily brief** — a Markdown download that compiles upcoming deadlines, this week's hearings with notice links, a ranked official-action queue, the top ten headlines, the next two weeks of Republican field events, and current influence, spending, and contract signals. A comma-separated watchlist can focus the action queue and downloaded brief on issues, agencies, organizations, people, vendors, or docket numbers. Countdown cards select the next three flagship political dates automatically, so the board never shows an expired countdown.
+
+The **Watchlist radar** uses the same in-session terms as the command center, expanding them into a cross-source research workspace. Suggested Texas issues can be mixed with custom terms. Each hit shows its exact matching term, and the workspace exports a UTF-8 CSV research log plus an ICS calendar for matching hearings and field events.
 
 Government and influence searches export every matching normalized record to CSV, rather than only the first 100 cards shown in the interface. Upcoming government meetings and deadlines can also be downloaded as an ICS calendar.
 

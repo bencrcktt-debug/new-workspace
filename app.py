@@ -32,6 +32,8 @@ from data_sources import (
     headline_priority,
     make_briefing,
     make_ics,
+    matched_watch_terms,
+    parse_watch_terms,
     select_action_records,
 )
 from models import (
@@ -40,8 +42,10 @@ from models import (
     Headline,
     Hearing,
     LegislatorSocialAccount,
+    LegislativeItem,
     Milestone,
     PoliticalEvent,
+    SocialPost,
     SourceResult,
     milestone_status,
     next_milestones,
@@ -915,6 +919,97 @@ def government_records_csv(items: Iterable[GovernmentRecord]) -> bytes:
     ).to_csv(index=False).encode("utf-8-sig")
 
 
+def watchlist_text(item: Any) -> str:
+    """Create a searchable representation of any normalized intelligence item."""
+    if isinstance(item, LegislativeItem):
+        return f"{item.title} {item.activity_type} {item.chamber} {item.summary}"
+    if isinstance(item, Hearing):
+        return f"{item.title} {item.chamber} {item.committee} {item.location} {item.summary}"
+    if isinstance(item, GovernmentRecord):
+        return " ".join(
+            [
+                item.title,
+                item.category,
+                item.agency,
+                item.summary,
+                item.status,
+                item.identifier,
+                item.value,
+            ]
+        )
+    if isinstance(item, Headline):
+        return f"{item.title} {item.publisher} {item.summary}"
+    if isinstance(item, PoliticalEvent):
+        return " ".join(
+            [item.title, item.region, item.organizer, item.event_type, item.venue, item.address]
+        )
+    if isinstance(item, SocialPost):
+        return f"{item.legislator_name} {item.handle} {item.text}"
+    return str(item)
+
+
+def watchlist_matches(items: Iterable[Any], terms: Iterable[str]) -> list[tuple[Any, tuple[str, ...]]]:
+    """Rank matches by the number of explicit terms, then by record recency."""
+    matched = [
+        (item, hits)
+        for item in items
+        if (hits := matched_watch_terms(watchlist_text(item), terms))
+    ]
+
+    def sort_key(entry: tuple[Any, tuple[str, ...]]) -> tuple[int, float]:
+        item, hits = entry
+        timestamp = next(
+            (
+                value.timestamp()
+                for value in (
+                    getattr(item, "occurs_at", None),
+                    getattr(item, "starts_at", None),
+                    getattr(item, "published_at", None),
+                    getattr(item, "created_at", None),
+                )
+                if value is not None
+            ),
+            0.0,
+        )
+        return len(hits), timestamp
+
+    return sorted(matched, key=sort_key, reverse=True)
+
+
+def watchlist_csv(groups: dict[str, list[tuple[Any, tuple[str, ...]]]]) -> bytes:
+    """A portable research log with the exact terms that caused each hit."""
+    rows: list[dict[str, str]] = []
+    for surface, entries in groups.items():
+        for item, hits in entries:
+            rows.append(
+                {
+                    "surface": surface,
+                    "matched_terms": "; ".join(hits),
+                    "title": getattr(item, "title", getattr(item, "text", "")),
+                    "organization": getattr(item, "agency", getattr(item, "publisher", getattr(item, "organizer", getattr(item, "legislator_name", "")))),
+                    "type": getattr(item, "category", getattr(item, "activity_type", getattr(item, "event_type", ""))),
+                    "status": getattr(item, "status", ""),
+                    "identifier": getattr(item, "identifier", ""),
+                    "when": next(
+                        (
+                            value.isoformat()
+                            for value in (
+                                getattr(item, "occurs_at", None),
+                                getattr(item, "starts_at", None),
+                                getattr(item, "published_at", None),
+                                getattr(item, "created_at", None),
+                            )
+                            if value is not None
+                        ),
+                        "",
+                    ),
+                    "summary": getattr(item, "summary", getattr(item, "text", "")),
+                    "source_url": getattr(item, "url", ""),
+                }
+            )
+    return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
+
+
 def field_calendar_panel(events: list[PoliticalEvent]) -> str:
     if not events:
         return '<div class="empty">No upcoming Republican events were returned.</div>'
@@ -1098,31 +1193,8 @@ def command_center() -> None:
         posts,
     ]
     responding = sum(1 for result in all_results if result.freshness != "unavailable")
-    st.markdown(
-        source_coverage_panel(
-            hearing_results, headline_results, event_results, directory, posts
-        ),
-        unsafe_allow_html=True,
-    )
     countdown_strip()
-    operations_strip(hearings, headlines, events)
-    st.markdown(
-        expanded_intelligence_panel(government_results, influence_results),
-        unsafe_allow_html=True,
-    )
-    watch_query = st.text_input(
-        "Focus watchlist",
-        placeholder="Water, school finance, grid reliability, property tax…",
-        help=(
-            "Enter comma-separated issues, agencies, organizations, docket numbers, "
-            "vendors, or people. The official action queue and downloaded brief will "
-            "focus on matching records."
-        ),
-        key="command_watchlist",
-    )
-    watch_terms = tuple(
-        term.strip() for term in watch_query.split(",") if term.strip()
-    )
+    watch_terms: tuple[str, ...] = ()
     action_records = select_action_records(
         [*government_records, *influence_records],
         now=datetime.now(CENTRAL),
@@ -1196,6 +1268,168 @@ def command_center() -> None:
             "text/markdown",
             width="stretch",
         )
+
+
+def watchlist_page() -> None:
+    st.markdown("## Watchlist radar")
+    st.caption(
+        "Track a policy, bill, agency, organization, person, vendor, or docket across official action, "
+        "legislative activity, reporting, field events, and public legislator posts. Every result shows the exact matching term."
+    )
+    suggestions = [
+        "Water", "Grid reliability", "Property tax", "School finance", "Border", "Medicaid", "Insurance", "Transportation"
+    ]
+    suggested = st.multiselect("Suggested Texas issues", suggestions, key="watchlist_suggestions")
+    terms_input = st.text_input(
+        "Your watchlist",
+        placeholder="e.g., ERCOT, SB 12, Austin Energy, Acme Corp",
+        help="Separate terms with commas. Watchlists persist while this browser session is open.",
+        key="watchlist_terms",
+    )
+    terms = parse_watch_terms([*parse_watch_terms(terms_input), *suggested])
+    if not terms:
+        empty_state("Add at least one term to activate the radar. Try a bill number, agency, organization, issue, or official.")
+        return
+    if tuple(parse_watch_terms(terms_input)) != terms:
+        st.caption(f"Active terms: {', '.join(terms)}")
+
+    token = configured_x_token()
+    base_url = str(get_secret("X_API_BASE_URL", "https://api.x.com") or "https://api.x.com")
+    with st.spinner("Scanning connected intelligence surfaces…"):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            activity_future = executor.submit(live_activity)
+            hearings_future = executor.submit(live_hearings)
+            headlines_future = executor.submit(live_headlines)
+            events_future = executor.submit(live_events)
+            government_future = executor.submit(live_government_intelligence)
+            influence_future = executor.submit(live_influence_intelligence)
+            directory_future = executor.submit(live_directory)
+            directory = directory_future.result()
+            accounts = public_feed_accounts(directory.items)
+            posts_future = (
+                executor.submit(live_x_list_posts, token, base_url)
+                if token
+                else executor.submit(live_public_posts, tuple(accounts))
+            )
+            activity_results = activity_future.result()
+            hearing_results = hearings_future.result()
+            headline_results = headlines_future.result()
+            event_results = events_future.result()
+            government_results = government_future.result()
+            influence_results = influence_future.result()
+            posts = posts_future.result()
+    if token and not posts.items:
+        posts = live_public_posts(tuple(accounts))
+    for result in (
+        *activity_results, *hearing_results, *headline_results, *event_results,
+        *government_results, *influence_results, directory, posts,
+    ):
+        remember(result)
+
+    groups: dict[str, list[tuple[Any, tuple[str, ...]]]] = {
+        "Official action": watchlist_matches(
+            [*flatten(government_results), *flatten(influence_results)], terms
+        ),
+        "Legislative activity": watchlist_matches(flatten(activity_results), terms),
+        "Hearings": watchlist_matches(flatten(hearing_results), terms),
+        "Media": watchlist_matches(dedupe_headlines(headline_results), terms),
+        "Field events": watchlist_matches(dedupe_events(event_results), terms),
+        "Legislator posts": watchlist_matches(posts.items, terms),
+    }
+    total_matches = sum(len(entries) for entries in groups.values())
+    official_count = len(groups["Official action"]) + len(groups["Legislative activity"]) + len(groups["Hearings"])
+    source_count = sum(1 for entries in groups.values() if entries)
+    metrics = st.columns(4)
+    with metrics[0]:
+        metric("Watchlist hits", str(total_matches), "explicit phrase matches")
+    with metrics[1]:
+        metric("Official signals", str(official_count), "records, bills, and hearings")
+    with metrics[2]:
+        metric("Surfaces activated", f"{source_count}/{len(groups)}", "connected intelligence types")
+    with metrics[3]:
+        metric("Tracked terms", str(len(terms)), ", ".join(terms[:3]) + ("…" if len(terms) > 3 else ""))
+
+    if total_matches:
+        export_col, calendar_col = st.columns(2)
+        with export_col:
+            st.download_button(
+                "Download watchlist research log (.csv)",
+                watchlist_csv(groups),
+                f"texas-watchlist-{TODAY.isoformat()}.csv",
+                "text/csv",
+                width="stretch",
+            )
+        dated_events = [
+            item for item, _ in [*groups["Hearings"], *groups["Field events"]]
+            if getattr(item, "starts_at", None)
+        ]
+        with calendar_col:
+            st.download_button(
+                "Add matched hearings and events (.ics)",
+                make_ics(dated_events, f"Texas watchlist: {', '.join(terms)}"),
+                f"texas-watchlist-calendar-{TODAY.isoformat()}.ics",
+                "text/calendar",
+                disabled=not dated_events,
+                width="stretch",
+            )
+    else:
+        empty_state("No current records match this watchlist. Keep the terms saved and refresh as source feeds update.")
+
+    official_tab, legislature_tab, media_tab, network_tab = st.tabs(
+        ["Official action", "Legislature", "Media", "Field & legislators"]
+    )
+    with official_tab:
+        entries = groups["Official action"]
+        st.caption(f"{len(entries)} matched government, regulatory, disclosure, or contract records.")
+        for item, hits in entries[:100]:
+            st.caption(f"Matched: {', '.join(hits)}")
+            government_record_card(item)
+        if not entries:
+            empty_state("No official records match the active terms.")
+    with legislature_tab:
+        activity = groups["Legislative activity"]
+        hearings = groups["Hearings"]
+        st.caption(f"{len(activity)} activity items and {len(hearings)} hearing notices match.")
+        for item, hits in activity[:50]:
+            st.caption(f"Matched: {', '.join(hits)}")
+            st.markdown(
+                f'<div class="record"><div class="record-top"><span class="tag tag-blue">{escape(item.chamber)}</span>'
+                f'<span class="tag">{escape(item.activity_type)}</span></div><div class="record-title">'
+                f'<a href="{safe_url(item.url)}" target="_blank">{escape(item.title)} ↗</a></div>'
+                f'<div class="record-summary">{escape(item.summary[:320])}</div><div class="meta">{escape(fmt_time(item.published_at))}</div></div>',
+                unsafe_allow_html=True,
+            )
+        for item, hits in hearings[:50]:
+            st.caption(f"Matched: {', '.join(hits)}")
+            hearing_card(item)
+        if not activity and not hearings:
+            empty_state("No legislative activity or hearing notices match the active terms.")
+    with media_tab:
+        entries = groups["Media"]
+        st.caption(f"{len(entries)} attributed headlines match.")
+        for item, hits in entries[:75]:
+            st.caption(f"Matched: {', '.join(hits)}")
+            headline_card(item)
+        if not entries:
+            empty_state("No current media items match the active terms.")
+    with network_tab:
+        events = groups["Field events"]
+        social = groups["Legislator posts"]
+        st.caption(f"{len(events)} field events and {len(social)} public legislator posts match.")
+        for item, hits in events[:50]:
+            st.caption(f"Matched: {', '.join(hits)}")
+            event_card(item)
+        for item, hits in social[:50]:
+            st.caption(f"Matched: {', '.join(hits)}")
+            st.markdown(
+                f'<div class="record"><div class="record-top"><span class="tag tag-blue">{escape(item.legislator_name)}</span>'
+                f'<span class="tag">@{escape(item.handle)}</span></div><div class="record-summary" style="margin-top:8px">'
+                f'{escape(item.text)}</div><div class="meta"><span>{escape(fmt_time(item.created_at))}</span>'
+                f'<span>{item.likes} likes</span><span>{item.reposts} reposts</span></div></div>',
+                unsafe_allow_html=True,
+            )
+        if not events and not social:
+            empty_state("No field events or public legislator posts match the active terms.")
 
 
 def legislature_page() -> None:
@@ -1964,6 +2198,7 @@ st.markdown(
 
 pages = [
     "Command center",
+    "Watchlist",
     "Legislature",
     "Campaign finance",
     "Influence",
@@ -1979,6 +2214,8 @@ page = st.session_state["bottom_navigation"]
 
 if page == "Command center":
     command_center()
+elif page == "Watchlist":
+    watchlist_page()
 elif page == "Legislature":
     legislature_page()
 elif page == "Campaign finance":

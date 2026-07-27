@@ -332,6 +332,30 @@ def extract_topics(text: str, limit: int = 3) -> list[str]:
     return labels
 
 
+def parse_watch_terms(value: str | Iterable[str]) -> tuple[str, ...]:
+    """Normalize a user watchlist without changing the analyst's display wording."""
+    raw_terms = value.split(",") if isinstance(value, str) else value
+    seen: set[str] = set()
+    terms: list[str] = []
+    for raw in raw_terms:
+        term = clean_text(str(raw)).strip()
+        key = term.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            terms.append(term)
+    return tuple(terms)
+
+
+def matched_watch_terms(text: str, terms: Iterable[str]) -> tuple[str, ...]:
+    """Return each configured term that occurs in normalized source text.
+
+    Phrase matching is intentionally transparent: analysts can see exactly why
+    a record entered a watchlist rather than relying on an opaque score.
+    """
+    haystack = clean_text(text).casefold()
+    return tuple(term for term in terms if term.casefold() in haystack)
+
+
 def headline_relevance(title: str, summary: str = "", publisher: str = "") -> int:
     """Score Texas political stories for an operational intelligence reader."""
     haystack = f"{title} {summary}".lower()

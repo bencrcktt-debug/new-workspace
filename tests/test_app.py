@@ -8,6 +8,7 @@ def test_all_navigation_sections_render() -> None:
     assert not app.exception
     expected = [
         "Command center",
+        "Watchlist",
         "Legislature",
         "Campaign finance",
         "Influence",

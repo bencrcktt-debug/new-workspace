@@ -32,6 +32,8 @@ from data_sources import (
     is_texas_political_story,
     make_briefing,
     make_ics,
+    matched_watch_terms,
+    parse_watch_terms,
     parse_bullpen_daily,
     parse_budget_updates,
     parse_contracts,
@@ -124,6 +126,12 @@ def test_datetime_is_normalized_to_central() -> None:
     assert parsed is not None
     assert parsed.tzinfo == CENTRAL
     assert parsed.hour == 11
+
+
+def test_watch_terms_are_deduplicated_and_phrase_matches_are_explicit() -> None:
+    terms = parse_watch_terms(" ERCOT, water, ercot,  ")
+    assert terms == ("ERCOT", "water")
+    assert matched_watch_terms("ERCOT water-market discussion", terms) == ("ERCOT", "water")
 
 
 def test_hearing_date_and_time_are_parsed_from_tlo_fields(monkeypatch: pytest.MonkeyPatch) -> None:
