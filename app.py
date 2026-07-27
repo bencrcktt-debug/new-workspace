@@ -32,8 +32,6 @@ from data_sources import (
     headline_priority,
     make_briefing,
     make_ics,
-    matched_watch_terms,
-    parse_watch_terms,
     select_action_records,
 )
 from models import (
@@ -78,6 +76,26 @@ COUNTDOWN_TARGETS = (
     ("Bill Filing Deadline", date(2027, 3, 12)),
     ("Sine Die — Session Ends", date(2027, 5, 31)),
 )
+
+
+def parse_watch_terms(value: str | Iterable[str]) -> tuple[str, ...]:
+    """Normalize the in-session watchlist while preserving display wording."""
+    raw_terms = value.split(",") if isinstance(value, str) else value
+    seen: set[str] = set()
+    terms: list[str] = []
+    for raw in raw_terms:
+        term = " ".join(str(raw).split())
+        key = term.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            terms.append(term)
+    return tuple(terms)
+
+
+def matched_watch_terms(text: str, terms: Iterable[str]) -> tuple[str, ...]:
+    """Give each watchlist hit a transparent, phrase-level explanation."""
+    haystack = text.casefold()
+    return tuple(term for term in terms if term.casefold() in haystack)
 
 st.set_page_config(
     page_title="Lone Star Ledger",
